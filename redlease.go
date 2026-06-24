@@ -195,6 +195,19 @@ func (e *Elector) Token() (token int64, ok bool) {
 	return t, t != 0
 }
 
+// Fencer returns a [Fencer] bound to the current leadership term and true while
+// this instance is the leader, or a zero Fencer and false otherwise. It is the
+// token-driven-style counterpart to the [Fencer] a [LeaderFunc] receives: code
+// outside the callback can take a Fencer and pass it down to its writers.
+//
+// Like [Elector.Token], the returned Fencer is a snapshot; leadership can change
+// immediately after. That is safe because the fence is enforced at write time —
+// a stale token is rejected by the Fencer's methods.
+func (e *Elector) Fencer() (f Fencer, ok bool) {
+	t := e.token.Load()
+	return Fencer{e: e, token: t}, t != 0
+}
+
 // IsLeader reports whether this instance currently holds leadership. It is
 // advisory only: leadership can be lost the instant after it returns, so never
 // gate a correctness-sensitive write on it. For writes, carry the token from
@@ -205,14 +218,14 @@ func (e *Elector) IsLeader() bool {
 }
 
 // LeaderFunc is the work run while an instance is leader. It receives a context
-// cancelled when leadership is lost or Run's context is cancelled, and the
-// fencing token for this leadership term. Stamp every fenced write with token.
-// LeaderFunc must return promptly once its context is cancelled; Run does not
-// release the lock or re-contend until it does.
-type LeaderFunc func(ctx context.Context, token int64)
+// cancelled when leadership is lost or Run's context is cancelled, and a [Fencer]
+// bound to this leadership term — use it for every fenced write, or pass it down
+// to the code that writes shared state. LeaderFunc must return promptly once its
+// context is cancelled; Run does not release the lock or re-contend until it does.
+type LeaderFunc func(ctx context.Context, f Fencer)
 
 // Run contends for leadership until ctx is cancelled. Each time this instance
-// wins, it invokes fn (a [LeaderFunc]) with the term's fencing token, then steps
+// wins, it invokes fn (a [LeaderFunc]) with a [Fencer] for the term, then steps
 // down and re-contends when leadership is lost. Run blocks until ctx is cancelled
 // and fn (if running) has returned; on the final shutdown step-down the
 // OnSteppedDown observer still fires.
@@ -221,6 +234,9 @@ type LeaderFunc func(ctx context.Context, token int64)
 // and releasing the lock — while the caller does its leader work from another
 // goroutine, gated on [Elector.Token]. This is the token-driven style; the
 // callback style and this one are interchangeable, pick whichever fits.
+//
+// Run must not be called more than once concurrently on the same Elector; the
+// two calls would corrupt shared leadership state. Use one Elector per Run.
 func (e *Elector) Run(ctx context.Context, fn LeaderFunc) {
 	// wasFollower tracks whether OnFollower has already fired for the current
 	// follower stretch, so it fires once per transition into the role rather than
@@ -279,7 +295,7 @@ func (e *Elector) lead(ctx context.Context, token int64, fn LeaderFunc) {
 		go func() {
 			defer close(done)
 
-			fn(leaderCtx, token)
+			fn(leaderCtx, Fencer{e: e, token: token})
 		}()
 
 		e.hold(leaderCtx)

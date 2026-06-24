@@ -164,8 +164,13 @@ func (e *Elector) FenceSet(ctx context.Context, token int64, key, value string) 
 
 // FenceEval fences an arbitrary Redis write supplied as a Lua body, for writes
 // the typed helpers do not cover (ZADD, XADD, multi-key updates, and so on). The
-// body runs atomically only when token is current; it must not return a value
-// (the fence returns 1 when applied, 0 when fenced out).
+// body runs atomically only when token is current; the fence returns 1 when
+// applied and 0 when fenced out.
+//
+// The body must not contain its own return statement: FenceEval appends the
+// fence's "return 1", so a return inside body shadows it and makes the result
+// report applied == false even on a write that ran. Just perform the write and
+// let FenceEval supply the return.
 //
 // Within body, the protected token check is already done. Address your own keys
 // and arguments starting at index 2 — KEYS[1] and ARGV[1] are reserved for the

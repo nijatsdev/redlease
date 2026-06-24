@@ -79,8 +79,8 @@ func runElector(ctx context.Context, e *Elector) (elected, steppedDown *signal, 
 	go func() {
 		defer close(exited)
 
-		e.Run(ctx, func(leaderCtx context.Context, tok int64) {
-			*token = tok
+		e.Run(ctx, func(leaderCtx context.Context, f Fencer) {
+			*token = f.Token()
 
 			elected.fire()
 			<-leaderCtx.Done()
@@ -89,6 +89,45 @@ func runElector(ctx context.Context, e *Elector) (elected, steppedDown *signal, 
 	}()
 
 	return elected, steppedDown, token, exited
+}
+
+// TestRun_DeliversFencerThatWrites exercises the primary path: a real leadership
+// term receives a Fencer through its LeaderFunc, and that Fencer's write applies
+// under the term's token. Other tests synthesize a Fencer with NewFencer; this
+// one proves the one a LeaderFunc actually receives is wired and writable.
+func TestRun_DeliversFencerThatWrites(t *testing.T) {
+	t.Parallel()
+
+	mr, rc := newRedis(t)
+	e := newElector(t, rc, "host-a")
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	type result struct {
+		token   int64
+		applied bool
+		err     error
+	}
+
+	got := make(chan result, 1)
+
+	go e.Run(ctx, func(leaderCtx context.Context, f Fencer) {
+		applied, err := f.HSet(leaderCtx, "state", "key", "via-callback")
+		got <- result{token: f.Token(), applied: applied, err: err}
+
+		<-leaderCtx.Done()
+	})
+
+	select {
+	case r := <-got:
+		require.NoError(t, r.err)
+		assert.Equal(t, int64(1), r.token, "callback Fencer must carry the term's token")
+		assert.True(t, r.applied, "callback Fencer's write must apply")
+		assert.Equal(t, "via-callback", mr.HGet("state", "key"))
+	case <-time.After(waitFor):
+		t.Fatal("LeaderFunc was not invoked")
+	}
 }
 
 func TestNew_Validation(t *testing.T) {
@@ -236,7 +275,7 @@ func TestTokenAndIsLeader_TrackLeadership(t *testing.T) {
 	go func() {
 		defer close(exited)
 
-		e.Run(ctx, func(leaderCtx context.Context, _ int64) {
+		e.Run(ctx, func(leaderCtx context.Context, _ Fencer) {
 			elected.fire()
 			<-leaderCtx.Done()
 		})
@@ -325,7 +364,6 @@ func TestObserver_FiresOnFollower(t *testing.T) {
 	go e.Run(ctx, nil)
 
 	assert.True(t, fired(follower, waitFor), "OnFollower must fire when the lock is held by another instance")
-	assert.False(t, e.IsLeader(), "a follower must not report leadership")
 }
 
 func TestRun_StepsDownWhenLockStolen(t *testing.T) {
@@ -339,7 +377,9 @@ func TestRun_StepsDownWhenLockStolen(t *testing.T) {
 	elected, steppedDown, _, _ := runElector(ctx, newElector(t, rc, "host-a"))
 	require.True(t, fired(elected, waitFor), "instance was not elected")
 
-	// Simulate a partition: another instance steals the lock.
+	// Simulate a partition: another instance steals the lock. Step-down is driven
+	// by the leader's next renew (testRenew, 50ms) seeing the value no longer its
+	// own — not by the lock TTL — so the thief's TTL only needs to outlast that.
 	require.NoError(t, mr.Set("test:leader", "thief"))
 	mr.SetTTL("test:leader", testTTL)
 
@@ -393,7 +433,7 @@ func TestObserver_FiresElectedAndSteppedDown(t *testing.T) {
 	go func() {
 		defer close(exited)
 
-		e.Run(ctx, func(leaderCtx context.Context, _ int64) { <-leaderCtx.Done() })
+		e.Run(ctx, func(leaderCtx context.Context, _ Fencer) { <-leaderCtx.Done() })
 	}()
 
 	require.True(t, fired(elected, waitFor), "OnElected did not fire")

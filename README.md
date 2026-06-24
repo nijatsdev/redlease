@@ -57,37 +57,41 @@ if err != nil {
 }
 
 // Run blocks until ctx is cancelled. The callback runs only while leader; its
-// context is cancelled the instant leadership is lost.
-e.Run(ctx, func(leaderCtx context.Context, token int64) {
-    applied, err := e.FenceHSet(leaderCtx, token, "jobs:report", "status", "running")
+// context is cancelled the instant leadership is lost. The Fencer carries this
+// term's fencing token — use it for every fenced write, or pass it down to the
+// code that writes shared state.
+e.Run(ctx, func(leaderCtx context.Context, f redlease.Fencer) {
+    applied, err := f.HSet(leaderCtx, "jobs:report", "status", "running")
     if err != nil {
         // Redis error.
     }
     if !applied {
-        // A newer leader has taken over; this token is stale. Stop working.
+        // A newer leader has taken over; this term is stale. Stop working.
         return
     }
 })
 ```
 
-All instances that should contend for the same leadership must share the same `Config.Name`. The token passed to your work function is the term's fencing token — stamp every fenced write with it.
+All instances that should contend for the same leadership must share the same `Config.Name`. The `Fencer` your work function receives is bound to the term's fencing token — pass it wherever shared state is written, and the token travels with it.
 
 ### Fenced writes
 
-Each fenced write checks the token and performs the write **atomically in a single Lua script**, so there is no window in which the token could go stale between the check and the write. All helpers share one high-water mark, so a token advanced by any of them fences every later, lower-token write:
+A `Fencer` binds the term's token to the elector that minted it, so you carry one value instead of threading a token and a client separately. Each fenced write checks the token and performs the write **atomically in a single Lua script**, so there is no window in which the token could go stale between the check and the write. All methods share one high-water mark, so a token advanced by any of them fences every later, lower-token write:
 
 ```go
-e.FenceHSet(ctx, token, hashKey, field, value) // fenced HSET
-e.FenceSet(ctx, token, key, value)             // fenced SET
+f.HSet(ctx, hashKey, field, value) // fenced HSET
+f.Set(ctx, key, value)             // fenced SET
 
 // Escape hatch for any other Redis write (ZADD, XADD, multi-key, ...).
 // KEYS[1]/ARGV[1] are reserved for the fence; address yours from index 2.
-e.FenceEval(ctx, token,
+f.Eval(ctx,
     "redis.call('zadd', KEYS[2], ARGV[2], ARGV[3])",
     []string{"board"}, "100", "alice")
 ```
 
-All three return `(applied bool, err error)`: `applied == false` means your token is stale — a newer leader has taken over — and you should stop writing.
+All three return `(applied bool, err error)`: `applied == false` means your token is stale — a newer leader has taken over — and you should stop writing. `f.Token()` returns the raw token for fencing a resource that isn't Redis (see below).
+
+The same writes are available on the elector itself — `e.FenceHSet(ctx, token, ...)`, `e.FenceSet`, `e.FenceEval` — taking the token explicitly. Use those in the token-driven style, where you hold a token from `e.Token()` rather than a `Fencer` from the callback.
 
 ### Observability
 
@@ -110,13 +114,13 @@ Only role transitions are reported, following the design of `client-go`'s `leade
 
 ### Checking leadership outside the callback
 
-The fencing token reaches your `LeaderFunc` directly, but sometimes another goroutine — an HTTP handler, say — needs to act as the leader too. `Token()` and `IsLeader()` expose the current state from any goroutine:
+The `Fencer` reaches your `LeaderFunc` directly, but sometimes another goroutine — an HTTP handler, say — needs to act as the leader too. `Fencer()`, `Token()`, and `IsLeader()` expose the current state from any goroutine:
 
 ```go
-if token, ok := e.Token(); ok {
+if f, ok := e.Fencer(); ok {
     // We are the leader. The fenced write is safe even if leadership changes
     // right now: a stale token is rejected at write time.
-    e.FenceHSet(ctx, token, "state", "key", "value")
+    f.HSet(ctx, "state", "key", "value")
 }
 ```
 

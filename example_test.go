@@ -32,8 +32,9 @@ func Example() {
 
 	// Run blocks until ctx is cancelled. The callback runs only while this
 	// instance is the leader; its context is cancelled the moment leadership
-	// is lost.
-	e.Run(ctx, func(leaderCtx context.Context, token int64) {
+	// is lost. The Fencer carries this term's fencing token — use it for every
+	// write to shared state.
+	e.Run(ctx, func(leaderCtx context.Context, f redlease.Fencer) {
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
 
@@ -45,7 +46,7 @@ func Example() {
 				// Record progress under the fencing token. If a newer leader
 				// has taken over, applied is false: this term is stale and
 				// must stop working.
-				applied, err := e.FenceHSet(leaderCtx, token, "jobs:report", "status", "running")
+				applied, err := f.HSet(leaderCtx, "jobs:report", "status", "running")
 				if err != nil {
 					log.Printf("write failed: %v", err)
 					continue
@@ -87,16 +88,15 @@ func Example_databaseFencing() {
 
 	ctx := context.Background()
 
-	e.Run(ctx, func(leaderCtx context.Context, token int64) {
+	e.Run(ctx, func(leaderCtx context.Context, f redlease.Fencer) {
+		// Take the term's token from the Fencer and enforce it yourself in SQL.
 		// The UPDATE applies only when our token is at least the stored fence,
-		// then advances it. A stale leader's lower token matches no row, so its
-		// write is rejected at the database — the same guarantee FenceHSet gives
-		// for Redis, enforced here in SQL.
+		// then advances it; a stale leader's lower token matches no row.
 		const q = `UPDATE state
 		             SET value = $1, fence = $2
 		           WHERE id = $3 AND fence <= $2`
 
-		res, err := db.ExecContext(leaderCtx, q, "running", token, "report")
+		res, err := db.ExecContext(leaderCtx, q, "running", f.Token(), "report")
 		if err != nil {
 			log.Printf("write failed: %v", err)
 			return

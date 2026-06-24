@@ -121,26 +121,54 @@ func TestFenceEval_FencesArbitraryWrite(t *testing.T) {
 	assert.InDelta(t, 100.0, score, 0.0001, "fenced-out ZADD must not change state")
 }
 
-// The fence high-water mark is shared across write types: a token advanced by
-// one helper fences a later, lower-token write through any other helper.
-func TestFence_HighWaterSharedAcrossWriteTypes(t *testing.T) {
+// A Fencer bound to a term applies its write under that term's token, and is
+// fenced out once a newer term has advanced the high-water mark. Because a
+// newer-token HSet here fences out a later Set and Eval, this also covers the
+// high-water mark being shared across all three write types.
+func TestFencer_BindsTokenToWrites(t *testing.T) {
 	t.Parallel()
 
-	_, rc := newRedis(t)
+	mr, rc := newRedis(t)
 	e := newElector(t, rc, "host-a")
 	ctx := t.Context()
 
-	// Advance the high-water mark to 5 via an HSET.
-	applied, err := e.FenceHSet(ctx, 5, "h", "f", "v")
+	f := NewFencer(e, 5)
+	assert.Equal(t, int64(5), f.Token())
+
+	applied, err := f.HSet(ctx, "state", "key", "via-fencer")
+	require.NoError(t, err)
+	require.True(t, applied)
+	assert.Equal(t, "via-fencer", mr.HGet("state", "key"))
+
+	applied, err = f.Set(ctx, "note", "via-fencer")
 	require.NoError(t, err)
 	require.True(t, applied)
 
-	// A SET with a lower token must now be fenced out too.
-	applied, err = e.FenceSet(ctx, 4, "k", "v")
-	require.NoError(t, err)
-	assert.False(t, applied, "high-water mark must be shared across write helpers")
+	const zadd = "redis.call('zadd', KEYS[2], ARGV[2], ARGV[3])"
 
-	exists, err := rc.Exists(ctx, "k").Result()
+	applied, err = f.Eval(ctx, zadd, []string{"board"}, "100", "alice")
 	require.NoError(t, err)
-	assert.Equal(t, int64(0), exists, "fenced-out SET must not have written the key")
+	require.True(t, applied)
+
+	// A newer term advances the high-water mark past this Fencer's token.
+	newer := NewFencer(e, 6)
+
+	applied, err = newer.HSet(ctx, "state", "key", "newer")
+	require.NoError(t, err)
+	require.True(t, applied)
+
+	// The stale Fencer is now fenced out across all of its write methods.
+	applied, err = f.HSet(ctx, "state", "key", "stale")
+	require.NoError(t, err)
+	assert.False(t, applied, "stale Fencer.HSet must be fenced out")
+
+	applied, err = f.Set(ctx, "note", "stale")
+	require.NoError(t, err)
+	assert.False(t, applied, "stale Fencer.Set must be fenced out")
+
+	applied, err = f.Eval(ctx, zadd, []string{"board"}, "999", "alice")
+	require.NoError(t, err)
+	assert.False(t, applied, "stale Fencer.Eval must be fenced out")
+
+	assert.Equal(t, "newer", mr.HGet("state", "key"))
 }
