@@ -146,6 +146,19 @@ func TestNew_Validation(t *testing.T) {
 	_, err = New(rc, Config{Name: "x", TTL: time.Second, RenewInterval: time.Second})
 	require.Error(t, err)
 
+	// AcquireInterval must be < TTL: a follower that polls slower than one lock
+	// lifetime would fail over far slower than necessary.
+	_, err = New(rc, Config{Name: "x", TTL: time.Second, RenewInterval: 200 * time.Millisecond, AcquireInterval: 2 * time.Second})
+	require.Error(t, err)
+
+	// TTL below the floor is rejected: renewal cannot reliably beat expiry.
+	_, err = New(rc, Config{Name: "x", TTL: 50 * time.Millisecond, RenewInterval: 10 * time.Millisecond})
+	require.Error(t, err)
+
+	// A TTL at the floor with sane intervals is accepted.
+	_, err = New(rc, Config{Name: "x", TTL: minTTL, RenewInterval: 20 * time.Millisecond, AcquireInterval: 20 * time.Millisecond})
+	require.NoError(t, err)
+
 	// Defaults fill in for zero timing fields.
 	e, err := New(rc, Config{Name: "x"})
 	require.NoError(t, err)
@@ -158,7 +171,7 @@ func TestTTLMillis_PreservesSubSecondPrecision(t *testing.T) {
 	_, rc := newRedis(t)
 
 	// A sub-second TTL must not collapse to 0 or round to a whole second.
-	e, err := New(rc, Config{Name: "x", TTL: 1500 * time.Millisecond, RenewInterval: 200 * time.Millisecond})
+	e, err := New(rc, Config{Name: "x", TTL: 1500 * time.Millisecond, RenewInterval: 200 * time.Millisecond, AcquireInterval: 200 * time.Millisecond})
 	require.NoError(t, err)
 	assert.Equal(t, "1500", e.ttlMillis(), "TTL must be expressed in whole milliseconds")
 
@@ -172,7 +185,7 @@ func TestAcquire_SetsMillisecondLockTTL(t *testing.T) {
 
 	mr, rc := newRedis(t)
 
-	e, err := New(rc, Config{Name: "test", TTL: 1500 * time.Millisecond, RenewInterval: 200 * time.Millisecond, InstanceID: "host-a"})
+	e, err := New(rc, Config{Name: "test", TTL: 1500 * time.Millisecond, RenewInterval: 200 * time.Millisecond, AcquireInterval: 200 * time.Millisecond, InstanceID: "host-a"})
 	require.NoError(t, err)
 
 	_, won, err := e.acquireLock(t.Context())

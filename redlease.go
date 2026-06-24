@@ -34,6 +34,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -48,6 +49,12 @@ const (
 	DefaultRenewInterval   = 2 * time.Second
 	DefaultAcquireInterval = 2 * time.Second
 )
+
+// minTTL is the smallest lock TTL [New] accepts. Below this, a renewal round
+// trip to Redis cannot reliably complete before the lock expires, so the leader
+// would flap. Callers needing a shorter failover window should reduce
+// RenewInterval against a TTL at or above this floor instead.
+const minTTL = 100 * time.Millisecond
 
 // Redis is the subset of the go-redis client this package needs: the script
 // runner used by all lock and fence operations. *goredis.Client and
@@ -66,14 +73,16 @@ type Config struct {
 
 	// TTL is how long the lock lives without renewal. A leader that cannot renew
 	// within TTL loses leadership. Shorter TTL means faster failover but less
-	// tolerance for pauses. Defaults to DefaultTTL.
+	// tolerance for pauses. Must be at least 100ms so a renewal can complete
+	// before expiry. Defaults to DefaultTTL.
 	TTL time.Duration
 
-	// RenewInterval is how often the leader renews the lock. Must be well below
-	// TTL. Defaults to DefaultRenewInterval.
+	// RenewInterval is how often the leader renews the lock. Must be less than
+	// TTL (and in practice well below it). Defaults to DefaultRenewInterval.
 	RenewInterval time.Duration
 
-	// AcquireInterval is how often a follower retries acquiring the lock.
+	// AcquireInterval is how often a follower retries acquiring the lock. Must be
+	// less than TTL, so a follower polls at least once per lock lifetime.
 	// Defaults to DefaultAcquireInterval.
 	AcquireInterval time.Duration
 
@@ -139,7 +148,8 @@ type Elector struct {
 }
 
 // New returns an Elector from cfg. It returns an error if required fields are
-// missing or timing parameters are inconsistent (e.g. RenewInterval >= TTL).
+// missing or timing parameters are inconsistent: TTL below 100ms, or
+// RenewInterval or AcquireInterval not less than TTL.
 func New(client Redis, cfg Config) (*Elector, error) {
 	if client == nil {
 		return nil, errors.New("redlease: nil client")
@@ -153,8 +163,16 @@ func New(client Redis, cfg Config) (*Elector, error) {
 	renew := orDuration(cfg.RenewInterval, DefaultRenewInterval)
 	acquire := orDuration(cfg.AcquireInterval, DefaultAcquireInterval)
 
+	if ttl < minTTL {
+		return nil, fmt.Errorf("redlease: TTL must be at least %s", minTTL)
+	}
+
 	if renew >= ttl {
 		return nil, errors.New("redlease: RenewInterval must be less than TTL")
+	}
+
+	if acquire >= ttl {
+		return nil, errors.New("redlease: AcquireInterval must be less than TTL")
 	}
 
 	id := cfg.InstanceID
