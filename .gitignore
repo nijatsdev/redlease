@@ -1,0 +1,16 @@
+# Local scratch
+/_local/
+
+# Test and coverage artifacts
+*.test
+*.out
+coverage.*
+
+# Go workspace file
+go.work
+go.work.sum
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/

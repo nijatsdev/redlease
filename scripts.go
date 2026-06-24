@@ -1,0 +1,223 @@
+package redlease
+
+import (
+	"context"
+	"strconv"
+	"time"
+
+	goredis "github.com/redis/go-redis/v9"
+)
+
+// acquireScript takes the lock with NX and, on success, increments the fence
+// counter atomically and returns the new token. Doing both in one script
+// guarantees every distinct leadership term gets a strictly greater token than
+// any term before it, even under concurrent acquire attempts. Returns 0 when the
+// lock is already held by another instance.
+//
+// KEYS[1] lock key, KEYS[2] fence counter. ARGV[1] instance id, ARGV[2] TTL ms.
+var acquireScript = goredis.NewScript(`
+if redis.call('set', KEYS[1], ARGV[1], 'NX', 'PX', ARGV[2]) then
+    return redis.call('incr', KEYS[2])
+else
+    return 0
+end
+`)
+
+// renewScript extends the lock TTL only when the stored value matches the
+// instance id, so a recovered instance cannot extend a lock another now holds.
+//
+// KEYS[1] lock key. ARGV[1] instance id, ARGV[2] TTL ms.
+var renewScript = goredis.NewScript(`
+if redis.call('get', KEYS[1]) == ARGV[1] then
+    return redis.call('pexpire', KEYS[1], ARGV[2])
+else
+    return 0
+end
+`)
+
+// releaseScript deletes the lock only when the stored value matches the instance
+// id, so an instance never deletes a lock another instance now holds.
+//
+// KEYS[1] lock key. ARGV[1] instance id.
+var releaseScript = goredis.NewScript(`
+if redis.call('get', KEYS[1]) == ARGV[1] then
+    return redis.call('del', KEYS[1])
+else
+    return 0
+end
+`)
+
+// fenceGuard is the Lua prologue shared by every fenced write. It loads the
+// highest applied token, rejects the call when the caller's token (ARGV[1]) is
+// lower, and otherwise advances the high-water mark. The caller's own write
+// follows, so the check and the write execute atomically in one round trip —
+// there is no window in which the token could go stale between them.
+//
+// KEYS[1] is always the applied-high-water key; ARGV[1] is always the token.
+// Each script appends its own write using the remaining KEYS/ARGV.
+const fenceGuard = `
+local applied = tonumber(redis.call('get', KEYS[1]) or '0')
+local token = tonumber(ARGV[1])
+if token < applied then
+    return 0
+end
+redis.call('set', KEYS[1], token)
+`
+
+// fenceHSetScript fences an HSET. KEYS[2] hash, ARGV[2] field, ARGV[3] value.
+var fenceHSetScript = goredis.NewScript(fenceGuard + `
+redis.call('hset', KEYS[2], ARGV[2], ARGV[3])
+return 1
+`)
+
+// fenceSetScript fences a SET. KEYS[2] key, ARGV[2] value.
+var fenceSetScript = goredis.NewScript(fenceGuard + `
+redis.call('set', KEYS[2], ARGV[2])
+return 1
+`)
+
+// acquireLock attempts to take the leader lock. On success it returns the
+// fencing token for this term (a strictly increasing value); won is false when
+// another instance holds the lock.
+func (e *Elector) acquireLock(ctx context.Context) (token int64, won bool, err error) {
+	n, err := acquireScript.Run(ctx, e.client, []string{e.lockKey, e.fenceKey}, e.id, e.ttlMillis()).Int64()
+	if err != nil {
+		return 0, false, err
+	}
+
+	if n == 0 {
+		return 0, false, nil
+	}
+
+	return n, true, nil
+}
+
+// hold renews the lock until it is lost or ctx is cancelled. A renewal that
+// returns 0 means another instance owns the lock (immediate step-down). A
+// transient Redis error is tolerated until the lock TTL would have lapsed, after
+// which we step down to avoid two leaders.
+func (e *Elector) hold(ctx context.Context) {
+	t := time.NewTicker(e.renew)
+	defer t.Stop()
+
+	lastRenew := time.Now()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			n, err := renewScript.Run(ctx, e.client, []string{e.lockKey}, e.id, e.ttlMillis()).Int()
+			switch {
+			case err != nil:
+				if ctx.Err() != nil {
+					return
+				}
+
+				if time.Since(lastRenew) >= e.ttl {
+					return // renewal failing past TTL; step down
+				}
+			case n == 0:
+				return // lock lost
+			default:
+				lastRenew = time.Now()
+			}
+		}
+	}
+}
+
+// release deletes the lock if this instance still owns it, so a successor need
+// not wait for the TTL to lapse. Best-effort: on failure the lock simply expires
+// at its TTL, which only delays failover.
+func (e *Elector) release() {
+	ctx, cancel := context.WithTimeout(context.Background(), e.ttl)
+	defer cancel()
+
+	_, _ = releaseScript.Run(ctx, e.client, []string{e.lockKey}, e.id).Result()
+}
+
+// FenceHSet performs a fenced HSET of field=value into hashKey: the write is
+// applied only if token is at least the highest token already applied through
+// this elector. It returns true when applied and false when token is stale — a
+// newer leadership term has since written — so the caller can stop emitting
+// derived events. token must be the value passed to the LeaderFunc for the
+// current term. A non-nil error means the write could not be attempted.
+func (e *Elector) FenceHSet(ctx context.Context, token int64, hashKey, field, value string) (applied bool, err error) {
+	n, err := fenceHSetScript.Run(ctx, e.client, []string{e.appliedKey, hashKey}, token, field, value).Int()
+	if err != nil {
+		return false, err
+	}
+
+	return n == 1, nil
+}
+
+// FenceSet performs a fenced SET of key=value, applied only if token is current.
+// Semantics match [Elector.FenceHSet].
+func (e *Elector) FenceSet(ctx context.Context, token int64, key, value string) (applied bool, err error) {
+	n, err := fenceSetScript.Run(ctx, e.client, []string{e.appliedKey, key}, token, value).Int()
+	if err != nil {
+		return false, err
+	}
+
+	return n == 1, nil
+}
+
+// FenceEval fences an arbitrary Redis write supplied as a Lua body, for writes
+// the typed helpers do not cover (ZADD, XADD, multi-key updates, and so on). The
+// body runs atomically only when token is current; it must not return a value
+// (the fence returns 1 when applied, 0 when fenced out).
+//
+// Within body, the protected token check is already done. Address your own keys
+// and arguments starting at index 2 — KEYS[1] and ARGV[1] are reserved for the
+// fence (the high-water key and the token). Pass your keys in writeKeys and your
+// arguments in args; they appear as KEYS[2..] and ARGV[2..] in that order.
+//
+// Example — fence a ZADD:
+//
+//	applied, err := e.FenceEval(ctx, token,
+//	    "redis.call('zadd', KEYS[2], ARGV[2], ARGV[3])",
+//	    []string{"myset"}, "1.0", "member")
+func (e *Elector) FenceEval(ctx context.Context, token int64, body string, writeKeys []string, args ...any) (applied bool, err error) {
+	keys := make([]string, 0, len(writeKeys)+1)
+	keys = append(keys, e.appliedKey)
+	keys = append(keys, writeKeys...)
+
+	evalArgs := make([]any, 0, len(args)+1)
+	evalArgs = append(evalArgs, token)
+	evalArgs = append(evalArgs, args...)
+
+	n, err := e.evalScript(body).Run(ctx, e.client, keys, evalArgs...).Int()
+	if err != nil {
+		return false, err
+	}
+
+	return n == 1, nil
+}
+
+// evalScript returns the compiled fenced script for body, caching it so repeated
+// FenceEval calls with the same body keep EVALSHA caching instead of recompiling
+// and re-sending the source each time.
+func (e *Elector) evalScript(body string) *goredis.Script {
+	if s, ok := e.evalScripts.Load(body); ok {
+		if script, ok := s.(*goredis.Script); ok {
+			return script
+		}
+	}
+
+	s := goredis.NewScript(fenceGuard + "\n" + body + "\nreturn 1\n")
+	actual, _ := e.evalScripts.LoadOrStore(body, s)
+
+	if script, ok := actual.(*goredis.Script); ok {
+		return script
+	}
+
+	return s
+}
+
+// ttlMillis renders the lock TTL in whole milliseconds for the Lua scripts,
+// preserving sub-second precision that a seconds-granularity TTL would truncate.
+func (e *Elector) ttlMillis() string {
+	ms := max(e.ttl.Milliseconds(), 1)
+
+	return strconv.FormatInt(ms, 10)
+}

@@ -1,0 +1,317 @@
+// Package redlease implements lease-based leader election on Redis with fencing
+// tokens.
+//
+// One instance holds a Redis lock with a TTL and runs the caller's work while it
+// is leader; if it cannot renew, it steps down so another instance takes over.
+// Unlike a plain Redis lock, every leadership term is assigned a strictly
+// increasing fencing token. Writes routed through the Elector's Fence* helpers
+// are rejected when they carry a token older than the latest applied, so a
+// paused or clock-skewed leader that still believes it holds the lock cannot
+// overwrite newer state.
+//
+// # When you need this
+//
+// Fencing matters only when a stale leader's write to shared state would be
+// harmful — for example a value that must not regress, a sequence number, or a
+// counter. If the leader does no writes, or writes self-healing last-writer-wins
+// state, a plain lock is enough and you do not need this package.
+//
+// # Correctness boundary
+//
+// The fence token is generated and stored in Redis. On a single Redis instance
+// this gives a strict, monotonic guarantee. On a replicated deployment (Sentinel
+// or Cluster), Redis replication is asynchronous: a primary can acknowledge the
+// acquire — and the token increment — before it reaches a replica, and a failover
+// to that replica can lose them. In that window the monotonicity the fence relies
+// on can be violated. For strict correctness across failover, source the fencing
+// token from a linearizable store (etcd, ZooKeeper) instead of Redis. This package
+// is the right tool when you run Redis single-instance, or when a brief, rare token
+// regression on failover is acceptable.
+package redlease
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"os"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	goredis "github.com/redis/go-redis/v9"
+)
+
+// Default timing parameters. Override via [Config].
+const (
+	DefaultTTL             = 5 * time.Second
+	DefaultRenewInterval   = 2 * time.Second
+	DefaultAcquireInterval = 2 * time.Second
+)
+
+// Redis is the subset of the go-redis client this package needs: the script
+// runner used by all lock and fence operations. *goredis.Client and
+// *goredis.ClusterClient both satisfy it, as does any compatible wrapper.
+type Redis interface {
+	goredis.Scripter
+}
+
+// Config configures an [Elector]. Only Name is required (the client is passed
+// separately to [New]); zero-valued timing fields fall back to the Default*
+// constants.
+type Config struct {
+	// Name identifies the lock. All instances contending for the same leadership
+	// must use the same Name; different Names are independent locks.
+	Name string
+
+	// TTL is how long the lock lives without renewal. A leader that cannot renew
+	// within TTL loses leadership. Shorter TTL means faster failover but less
+	// tolerance for pauses. Defaults to DefaultTTL.
+	TTL time.Duration
+
+	// RenewInterval is how often the leader renews the lock. Must be well below
+	// TTL. Defaults to DefaultRenewInterval.
+	RenewInterval time.Duration
+
+	// AcquireInterval is how often a follower retries acquiring the lock.
+	// Defaults to DefaultAcquireInterval.
+	AcquireInterval time.Duration
+
+	// InstanceID uniquely identifies this instance; it is the lock's value and
+	// guards renewal and release so an instance never affects another's lock. If
+	// empty, a hostname + random suffix is generated.
+	InstanceID string
+
+	// Observer receives lifecycle events. All fields are optional; the library
+	// emits no output of its own, so callers wire these to their own logger,
+	// metrics, or tracing as they see fit.
+	Observer Observer
+}
+
+// Observer is a set of optional callbacks invoked on leadership transitions. A
+// nil field is simply not called. Callbacks run on the Run goroutine and must
+// not block; offload slow work (I/O, network) to a goroutine of your own.
+//
+// Only leadership transitions are reported, mirroring the design of
+// k8s.io/client-go/tools/leaderelection. Transient Redis errors during acquire
+// or renewal are handled internally; their only consequence the caller cares
+// about — losing leadership — surfaces through OnSteppedDown. Monitor Redis
+// health through your Redis client, not through this Observer.
+type Observer struct {
+	// OnElected fires when this instance wins a leadership term, with that
+	// term's fencing token. It fires before the LeaderFunc is invoked.
+	OnElected func(token int64)
+
+	// OnSteppedDown fires when this instance loses or relinquishes leadership,
+	// after the LeaderFunc has returned.
+	OnSteppedDown func()
+}
+
+// Elector runs leader election for a single lock and mints fencing tokens.
+type Elector struct {
+	client Redis
+
+	lockKey    string
+	fenceKey   string
+	appliedKey string
+	id         string
+
+	ttl     time.Duration
+	renew   time.Duration
+	acquire time.Duration
+
+	obs Observer
+
+	// token holds the current leadership term's fencing token, or 0 when this
+	// instance is not the leader. Real tokens start at 1, so 0 is a safe
+	// "not leader" sentinel. Read via Token / IsLeader from any goroutine.
+	token atomic.Int64
+
+	// evalScripts caches compiled FenceEval scripts keyed by Lua body.
+	evalScripts sync.Map
+}
+
+// New returns an Elector from cfg. It returns an error if required fields are
+// missing or timing parameters are inconsistent (e.g. RenewInterval >= TTL).
+func New(client Redis, cfg Config) (*Elector, error) {
+	if client == nil {
+		return nil, errors.New("redlease: nil client")
+	}
+
+	if cfg.Name == "" {
+		return nil, errors.New("redlease: empty Name")
+	}
+
+	ttl := orDuration(cfg.TTL, DefaultTTL)
+	renew := orDuration(cfg.RenewInterval, DefaultRenewInterval)
+	acquire := orDuration(cfg.AcquireInterval, DefaultAcquireInterval)
+
+	if renew >= ttl {
+		return nil, errors.New("redlease: RenewInterval must be less than TTL")
+	}
+
+	id := cfg.InstanceID
+	if id == "" {
+		id = instanceID()
+	}
+
+	return &Elector{
+		client:     client,
+		lockKey:    cfg.Name + ":leader",
+		fenceKey:   cfg.Name + ":fence",
+		appliedKey: cfg.Name + ":fence:applied",
+		id:         id,
+		ttl:        ttl,
+		renew:      renew,
+		acquire:    acquire,
+		obs:        cfg.Observer,
+	}, nil
+}
+
+// InstanceID returns this elector's instance identity.
+func (e *Elector) InstanceID() string { return e.id }
+
+// Token returns the current leadership term's fencing token and true while this
+// instance is the leader, or 0 and false otherwise. It is safe to call from any
+// goroutine, so code outside the LeaderFunc can perform fenced writes:
+//
+//	if token, ok := e.Token(); ok {
+//	    e.FenceHSet(ctx, token, "state", "key", "value")
+//	}
+//
+// The returned token is a snapshot; leadership can change immediately after.
+// That is safe because the fence is enforced at write time — a stale token is
+// rejected by the Fence* helpers — so unlike [Elector.IsLeader] there is no
+// time-of-check-to-time-of-use hazard in acting on it.
+func (e *Elector) Token() (token int64, ok bool) {
+	t := e.token.Load()
+	return t, t != 0
+}
+
+// IsLeader reports whether this instance currently holds leadership. It is
+// advisory only: leadership can be lost the instant after it returns, so never
+// gate a correctness-sensitive write on it. For writes, carry the token from
+// [Elector.Token] through a Fence* helper, which rejects a stale token at write
+// time.
+func (e *Elector) IsLeader() bool {
+	return e.token.Load() != 0
+}
+
+// LeaderFunc is the work run while an instance is leader. It receives a context
+// cancelled when leadership is lost or Run's context is cancelled, and the
+// fencing token for this leadership term. Stamp every fenced write with token.
+// LeaderFunc must return promptly once its context is cancelled; Run does not
+// release the lock or re-contend until it does.
+type LeaderFunc func(ctx context.Context, token int64)
+
+// Run contends for leadership until ctx is cancelled. Each time this instance
+// wins, it invokes fn (a [LeaderFunc]) with the term's fencing token, then steps
+// down and re-contends when leadership is lost. Run blocks until ctx is cancelled
+// and fn (if running) has returned; on the final shutdown step-down the
+// OnSteppedDown observer still fires.
+//
+// fn may be nil. Then Run just keeps this instance elected — acquiring, renewing,
+// and releasing the lock — while the caller does its leader work from another
+// goroutine, gated on [Elector.Token]. This is the token-driven style; the
+// callback style and this one are interchangeable, pick whichever fits.
+func (e *Elector) Run(ctx context.Context, fn LeaderFunc) {
+	for ctx.Err() == nil {
+		token, won, err := e.acquireLock(ctx)
+
+		switch {
+		case err != nil:
+			if ctx.Err() != nil {
+				return
+			}
+			// Transient acquire failure; back off and retry.
+		case won:
+			e.lead(ctx, token, fn)
+		}
+
+		if !sleepOrDone(ctx, e.acquire) {
+			return
+		}
+	}
+}
+
+// lead holds the lock for one leadership term, then releases it. When fn is
+// non-nil it runs in its own goroutine with a derived context; lead cancels that
+// context and waits for it to return before releasing, so a successor never
+// starts before the previous holder has fully stopped. When fn is nil, lead
+// simply holds leadership until the lock is lost or ctx is cancelled — the
+// caller drives its work elsewhere via Token / FenceHSet.
+func (e *Elector) lead(ctx context.Context, token int64, fn LeaderFunc) {
+	e.token.Store(token)
+
+	if e.obs.OnElected != nil {
+		e.obs.OnElected(token)
+	}
+
+	if fn == nil {
+		e.hold(ctx)
+	} else {
+		leaderCtx, cancel := context.WithCancel(ctx)
+		done := make(chan struct{})
+
+		go func() {
+			defer close(done)
+
+			fn(leaderCtx, token)
+		}()
+
+		e.hold(leaderCtx)
+		cancel()
+		<-done
+	}
+
+	// Clear the token before releasing so a concurrent Token/IsLeader caller
+	// stops seeing this instance as leader as soon as the work has stopped.
+	e.token.Store(0)
+	e.release()
+
+	if e.obs.OnSteppedDown != nil {
+		e.obs.OnSteppedDown()
+	}
+}
+
+func orDuration(v, fallback time.Duration) time.Duration {
+	if v <= 0 {
+		return fallback
+	}
+
+	return v
+}
+
+// instanceID returns a process-unique identity (hostname + random suffix) so two
+// instances never share a value and cannot extend or release each other's lock.
+func instanceID() string {
+	host, _ := os.Hostname()
+
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		if host != "" {
+			return host
+		}
+
+		return "unknown"
+	}
+
+	suffix := hex.EncodeToString(b)
+	if host != "" {
+		return host + "-" + suffix
+	}
+
+	return suffix
+}
+
+func sleepOrDone(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
