@@ -3,6 +3,7 @@ package redlease
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -337,16 +338,23 @@ func TestRun_FollowerTakesOverWhenLeaderExits(t *testing.T) {
 	assert.Greater(t, *tokenB, *tokenA, "successor must get a strictly greater fencing token")
 }
 
-func TestObserver_FiresOnFollower(t *testing.T) {
+// OnFollower fires once per transition into the follower role, not once ever: an
+// instance that follows, wins a term, then loses it must see OnFollower again.
+// Phase 1 covers the first fire (the lock starts held by another instance);
+// phase 3 covers the re-entry the Observer doc promises ("again only after an
+// intervening leadership term").
+func TestObserver_FiresOnFollowerAgainAfterLosingLeadership(t *testing.T) {
 	t.Parallel()
 
 	mr, rc := newRedis(t)
 
-	// Another instance already holds the lock, so this elector can only follow.
+	// Start as a follower: another instance holds the lock.
 	require.NoError(t, mr.Set("test:leader", "someone-else"))
 	mr.SetTTL("test:leader", time.Hour)
 
-	follower := newSignal()
+	var followerCount atomic.Int64
+
+	elected := newSignal()
 
 	e, err := New(rc, Config{
 		Name:            "test",
@@ -354,7 +362,10 @@ func TestObserver_FiresOnFollower(t *testing.T) {
 		RenewInterval:   testRenew,
 		AcquireInterval: testAcquire,
 		InstanceID:      "host-b",
-		Observer:        Observer{OnFollower: follower.fire},
+		Observer: Observer{
+			OnFollower: func() { followerCount.Add(1) },
+			OnElected:  func(int64) { elected.fire() },
+		},
 	})
 	require.NoError(t, err)
 
@@ -363,7 +374,87 @@ func TestObserver_FiresOnFollower(t *testing.T) {
 
 	go e.Run(ctx, nil)
 
-	assert.True(t, fired(follower, waitFor), "OnFollower must fire when the lock is held by another instance")
+	// Phase 1 — follower: OnFollower fires once for entering the role.
+	require.Eventually(t, func() bool { return followerCount.Load() == 1 },
+		waitFor, 10*time.Millisecond, "OnFollower must fire on first becoming a follower")
+
+	// Phase 2 — leader: free the lock so this instance wins the next acquire.
+	mr.Del("test:leader")
+	require.True(t, fired(elected, waitFor), "instance must win once the lock is free")
+
+	// Phase 3 — follower again: steal the lock so the leader's renew sees it lost
+	// and steps down, then re-enters the follower role on the next failed acquire.
+	require.NoError(t, mr.Set("test:leader", "thief"))
+	mr.SetTTL("test:leader", time.Hour)
+
+	require.Eventually(t, func() bool { return followerCount.Load() == 2 },
+		waitFor, 10*time.Millisecond, "OnFollower must fire again after an intervening leadership term")
+}
+
+// OnElected fires once per leadership term, not once ever, and each term carries
+// a strictly greater fencing token. An instance that wins, loses, then wins again
+// must see OnElected twice with an increasing token — the symmetric counterpart
+// to the OnFollower re-entry above, and the contract that gives every term a
+// fresh fence.
+func TestObserver_FiresOnElectedEachTermWithGreaterToken(t *testing.T) {
+	t.Parallel()
+
+	mr, rc := newRedis(t)
+
+	var (
+		mu     sync.Mutex
+		tokens []int64
+	)
+
+	e, err := New(rc, Config{
+		Name:            "test",
+		TTL:             testTTL,
+		RenewInterval:   testRenew,
+		AcquireInterval: testAcquire,
+		InstanceID:      "host-a",
+		Observer: Observer{
+			OnElected: func(token int64) {
+				mu.Lock()
+				defer mu.Unlock()
+
+				tokens = append(tokens, token)
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	go e.Run(ctx, nil)
+
+	count := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+
+		return len(tokens)
+	}
+
+	// Term 1: nothing holds the lock, so this instance wins.
+	require.Eventually(t, func() bool { return count() == 1 },
+		waitFor, 10*time.Millisecond, "OnElected must fire on the first term")
+
+	// Steal the lock so the leader's renew sees it lost and steps down.
+	require.NoError(t, mr.Set("test:leader", "thief"))
+	mr.SetTTL("test:leader", testTTL)
+
+	// Free it again so this instance wins a second term.
+	require.Eventually(t, func() bool { return !e.IsLeader() },
+		waitFor, 10*time.Millisecond, "instance must step down once the lock is stolen")
+	mr.Del("test:leader")
+
+	require.Eventually(t, func() bool { return count() == 2 },
+		waitFor, 10*time.Millisecond, "OnElected must fire again on a second term")
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	assert.Greater(t, tokens[1], tokens[0], "each term's fencing token must be strictly greater")
 }
 
 func TestRun_StepsDownWhenLockStolen(t *testing.T) {
@@ -391,14 +482,17 @@ func TestRun_StepsDownWhenLockStolen(t *testing.T) {
 	assert.Equal(t, "thief", val, "step-down must not delete a lock held by another instance")
 }
 
-func TestObserver_FiresElectedAndSteppedDown(t *testing.T) {
+// OnSteppedDown fires after a leadership term ends, never during it: while the
+// leader still holds the lock it must not have fired, and it must fire once the
+// term ends (here via shutdown). The token OnElected carries is covered by
+// TestObserver_FiresOnElectedEachTermWithGreaterToken.
+func TestObserver_SteppedDownFiresAfterLeadership(t *testing.T) {
 	t.Parallel()
 
 	_, rc := newRedis(t)
 
 	var (
 		mu          sync.Mutex
-		electedTok  int64
 		steppedDown bool
 	)
 
@@ -411,16 +505,12 @@ func TestObserver_FiresElectedAndSteppedDown(t *testing.T) {
 		AcquireInterval: testAcquire,
 		InstanceID:      "host-a",
 		Observer: Observer{
-			OnElected: func(token int64) {
-				mu.Lock()
-				electedTok = token
-				mu.Unlock()
-				elected.fire()
-			},
+			OnElected: func(int64) { elected.fire() },
 			OnSteppedDown: func() {
 				mu.Lock()
+				defer mu.Unlock()
+
 				steppedDown = true
-				mu.Unlock()
 			},
 		},
 	})
@@ -439,7 +529,6 @@ func TestObserver_FiresElectedAndSteppedDown(t *testing.T) {
 	require.True(t, fired(elected, waitFor), "OnElected did not fire")
 
 	mu.Lock()
-	assert.Equal(t, int64(1), electedTok, "OnElected must receive the term's fencing token")
 	assert.False(t, steppedDown, "OnSteppedDown fired before leadership ended")
 	mu.Unlock()
 
@@ -452,6 +541,7 @@ func TestObserver_FiresElectedAndSteppedDown(t *testing.T) {
 	}
 
 	mu.Lock()
+	defer mu.Unlock()
+
 	assert.True(t, steppedDown, "OnSteppedDown must fire after leadership ends")
-	mu.Unlock()
 }
