@@ -298,6 +298,36 @@ func TestRun_FollowerTakesOverWhenLeaderExits(t *testing.T) {
 	assert.Greater(t, *tokenB, *tokenA, "successor must get a strictly greater fencing token")
 }
 
+func TestObserver_FiresOnFollower(t *testing.T) {
+	t.Parallel()
+
+	mr, rc := newRedis(t)
+
+	// Another instance already holds the lock, so this elector can only follow.
+	require.NoError(t, mr.Set("test:leader", "someone-else"))
+	mr.SetTTL("test:leader", time.Hour)
+
+	follower := newSignal()
+
+	e, err := New(rc, Config{
+		Name:            "test",
+		TTL:             testTTL,
+		RenewInterval:   testRenew,
+		AcquireInterval: testAcquire,
+		InstanceID:      "host-b",
+		Observer:        Observer{OnFollower: follower.fire},
+	})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	go e.Run(ctx, nil)
+
+	assert.True(t, fired(follower, waitFor), "OnFollower must fire when the lock is held by another instance")
+	assert.False(t, e.IsLeader(), "a follower must not report leadership")
+}
+
 func TestRun_StepsDownWhenLockStolen(t *testing.T) {
 	t.Parallel()
 

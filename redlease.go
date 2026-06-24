@@ -92,7 +92,7 @@ type Config struct {
 // nil field is simply not called. Callbacks run on the Run goroutine and must
 // not block; offload slow work (I/O, network) to a goroutine of your own.
 //
-// Only leadership transitions are reported, mirroring the design of
+// Only role transitions are reported, mirroring the design of
 // k8s.io/client-go/tools/leaderelection. Transient Redis errors during acquire
 // or renewal are handled internally; their only consequence the caller cares
 // about — losing leadership — surfaces through OnSteppedDown. Monitor Redis
@@ -105,6 +105,13 @@ type Observer struct {
 	// OnSteppedDown fires when this instance loses or relinquishes leadership,
 	// after the LeaderFunc has returned.
 	OnSteppedDown func()
+
+	// OnFollower fires when this instance is, for now, a follower: an acquire
+	// attempt found the lock held by another instance. It fires once per
+	// transition into the follower role — on the first lost attempt, and again
+	// only after an intervening leadership term — not on every retry. A consumer
+	// can use it to learn its initial role at startup without waiting to win.
+	OnFollower func()
 }
 
 // Elector runs leader election for a single lock and mints fencing tokens.
@@ -215,6 +222,11 @@ type LeaderFunc func(ctx context.Context, token int64)
 // goroutine, gated on [Elector.Token]. This is the token-driven style; the
 // callback style and this one are interchangeable, pick whichever fits.
 func (e *Elector) Run(ctx context.Context, fn LeaderFunc) {
+	// wasFollower tracks whether OnFollower has already fired for the current
+	// follower stretch, so it fires once per transition into the role rather than
+	// on every losing retry. A leadership term resets it.
+	wasFollower := false
+
 	for ctx.Err() == nil {
 		token, won, err := e.acquireLock(ctx)
 
@@ -225,7 +237,18 @@ func (e *Elector) Run(ctx context.Context, fn LeaderFunc) {
 			}
 			// Transient acquire failure; back off and retry.
 		case won:
+			wasFollower = false
+
 			e.lead(ctx, token, fn)
+		default:
+			// Lock held by another instance: we are a follower.
+			if !wasFollower {
+				wasFollower = true
+
+				if e.obs.OnFollower != nil {
+					e.obs.OnFollower()
+				}
+			}
 		}
 
 		if !sleepOrDone(ctx, e.acquire) {

@@ -99,11 +99,14 @@ e, _ := redlease.New(rc, redlease.Config{
     Observer: redlease.Observer{
         OnElected:     func(token int64) { slog.Info("leader elected", "fence", token) },
         OnSteppedDown: func()            { slog.Info("leader stepped down") },
+        OnFollower:    func()            { slog.Info("running as follower") },
     },
 })
 ```
 
-Only leadership transitions are reported, following the design of `client-go`'s `leaderelection`. Transient Redis errors during acquire or renewal are handled internally; the consequence the caller cares about — losing leadership — surfaces through `OnSteppedDown`. Monitor Redis health through your Redis client, not through the `Observer`. Callbacks run on the `Run` goroutine and must not block.
+`OnFollower` fires when an acquire attempt finds the lock held by another instance — once per transition into the follower role, not on every retry. It lets a follower learn its initial role at startup without waiting to win.
+
+Only role transitions are reported, following the design of `client-go`'s `leaderelection`. Transient Redis errors during acquire or renewal are handled internally; the consequence the caller cares about — losing leadership — surfaces through `OnSteppedDown`. Monitor Redis health through your Redis client, not through the `Observer`. Callbacks run on the `Run` goroutine and must not block.
 
 ### Checking leadership outside the callback
 
