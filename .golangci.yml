@@ -1,0 +1,63 @@
+version: "2"
+run:
+  concurrency: 4
+  timeout: 5m
+  tests: true
+
+issues:
+  max-issues-per-linter: 0  # 0 = unlimited
+  max-same-issues: 50
+
+linters:
+  # HTTP, slog, SQL/security, and large-codebase complexity linters are omitted:
+  # this package has no such surface.
+  enable:
+    # correctness
+    - govet            # printf formats, copylocks, struct tags, unreachable code
+    - staticcheck      # deprecated APIs, common mistakes, simplifications
+    - unused           # unused variables, functions, types
+    - errcheck         # unchecked error returns and type assertions
+    - errorlint        # correct errors.Is/As and %w wrapping
+    - copyloopvar      # loop variable copy issues (Go 1.22+)
+    # safety (cheap, catches trojan-source style attacks in a dependency people trust)
+    - asciicheck       # non-ASCII identifiers (homoglyph/trojan source)
+    - bidichk          # dangerous bidirectional Unicode (CVE-2021-42574)
+    # style / idiom
+    - gocritic         # unnecessary conversions, range copies, redundant code
+    - revive           # naming, exported docs, package-name stutter
+    - misspell         # common English misspellings
+    - dupword          # duplicate words in comments (the the)
+    - godot            # exported-symbol comments end with a period
+    - whitespace       # trailing whitespace, stray blank lines
+    - wsl_v5           # blank-line readability rules
+    # testing
+    - testifylint      # testify best practices
+    - thelper          # test helpers missing t.Helper()
+    - usetesting       # t.Setenv/t.TempDir over os equivalents
+    - paralleltest     # tests/subtests missing t.Parallel()
+    # modernization & meta
+    - modernize        # patterns replaceable with newer Go features
+    - intrange         # range over int instead of C-style loop (Go 1.22+)
+    - usestdlibvars    # stdlib constants over hardcoded values
+    - nolintlint       # proper //nolint directive usage
+
+  settings:
+    errcheck:
+      check-type-assertions: true
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+    wsl_v5:
+      allow-first-in-block: true
+      allow-whole-block: false
+      branch-max-lines: 2
+
+formatters:
+  enable:
+    - gofmt
+    - gofumpt
+  settings:
+    gofumpt:
+      extra-rules: true
+  exclusions:
+    generated: lax

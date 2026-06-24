@@ -1,0 +1,30 @@
+version: 2
+updates:
+  # Go module dependencies (go-redis, miniredis, testify, ...).
+  - package-ecosystem: gomod
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+    groups:
+      # Minor/patch bumps batched; majors stay separate.
+      go-dependencies:
+        update-types:
+          - minor
+          - patch
+
+  # GitHub Actions used by the CI workflow.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+    groups:
+      actions:
+        update-types:
+          - minor
+          - patch
