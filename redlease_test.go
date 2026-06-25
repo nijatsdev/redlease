@@ -142,9 +142,18 @@ func TestNew_Validation(t *testing.T) {
 	_, err = New(rc, Config{Name: ""})
 	require.Error(t, err)
 
-	// RenewInterval must be < TTL.
+	// RenewInterval equal to TTL leaves no renewal headroom.
 	_, err = New(rc, Config{Name: "x", TTL: time.Second, RenewInterval: time.Second})
 	require.Error(t, err)
+
+	// RenewInterval above TTL/2 is rejected: fewer than two attempts fit before
+	// expiry, so a single dropped renewal costs leadership.
+	_, err = New(rc, Config{Name: "x", TTL: time.Second, RenewInterval: 600 * time.Millisecond})
+	require.Error(t, err)
+
+	// RenewInterval at exactly TTL/2 is accepted.
+	_, err = New(rc, Config{Name: "x", TTL: time.Second, RenewInterval: 500 * time.Millisecond})
+	require.NoError(t, err)
 
 	// AcquireInterval must be < TTL: a follower that polls slower than one lock
 	// lifetime would fail over far slower than necessary.
