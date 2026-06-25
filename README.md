@@ -12,15 +12,15 @@ go get github.com/nijatsdev/redlease
 
 > Pre-1.0: the API may change between `v0.x` releases.
 
-redlease elects **one long-lived leader** among instances and keeps it elected — for running a singleton background job, a scheduler, a cron-like task, or the single writer in a one-writer-many-readers system. It manages the whole leadership lifecycle: acquire, renew, step down, release, and fail over.
+redlease elects **one long-lived leader** among instances and keeps it elected — for a singleton background job, a scheduler, a cron-like task, or the single writer in a one-writer-many-readers system. It manages the whole leadership lifecycle: acquire, renew, step down, release, and fail over.
 
-It is **not** a general-purpose mutex. For short-lived mutual exclusion around a critical section, use [redsync](https://github.com/go-redsync/redsync) or [redislock](https://github.com/bsm/redislock) instead. The litmus test:
+It is **not** a general-purpose mutex. The litmus test:
 
 > Is the lock held for the duration of a **role** or the duration of an **operation**?
 > Role (be the leader, own the schedule, be the one writer) → **redlease**.
-> Operation (guard this critical section, update this counter safely) → a mutex.
+> Operation (guard this critical section, update this counter safely) → a distributed mutex.
 
-One instance holds a Redis lock with a TTL and runs your work while it is leader. If it cannot renew the lock, it steps down so another instance takes over. That much is what every Redis-lock library does. What redlease adds is the part most of them omit:
+One instance holds a Redis lock with a TTL and runs your work while it is leader. If it cannot renew the lock, it steps down so another instance takes over. What redlease adds on top:
 
 **Every leadership term is assigned a strictly increasing fencing token, and writes routed through the `Fence*` helpers reject any token older than the latest applied.** A paused, GC-stalled, or clock-skewed leader that still believes it holds the lock cannot overwrite newer state — its writes are refused at Redis.
 
@@ -28,9 +28,9 @@ One instance holds a Redis lock with a TTL and runs your work while it is leader
 
 ## Why fencing
 
-Lock-based leader election has an unavoidable window. The lock has a TTL; if the leader pauses (GC, CPU starvation) or is partitioned, the lock can expire and a second instance can be elected **while the first still thinks it is leader**. For a few seconds, two leaders exist. This is inherent to *any* lease-based lock — shortening the TTL only shrinks the window, it never closes it.
+Lease-based leader election has an unavoidable window. The lock has a TTL; if the leader pauses (GC, CPU starvation) or is partitioned, the lock can expire and a second instance can be elected **while the first still thinks it is leader**. For a few seconds, two leaders exist. This is inherent to *any* lease-based lock — shortening the TTL only shrinks the window, it never closes it.
 
-Fencing makes that window safe. Each term gets a token; the protected resource only accepts writes whose token is at least the highest it has already seen. The stale leader's writes carry an old token and are rejected. This is the mitigation Martin Kleppmann describes in [*How to do distributed locking*](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html) — and the reason a plain Redis lock is not safe for correctness-sensitive writes.
+Fencing makes that window safe. Each term gets a token; the protected resource only accepts writes whose token is at least the highest it has already seen. The stale leader's writes carry an old token and are rejected. This is the mitigation Martin Kleppmann describes in [*How to do distributed locking*](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html).
 
 ### Do you actually need it?
 
@@ -42,7 +42,7 @@ Fencing matters **only** when a stale leader's write to shared state would be ha
 | does no writes (runs a cron, sends notifications) | No — at most you want idempotency/dedup |
 | writes self-healing last-writer-wins state that the next correct write repairs | No — a plain lock is enough |
 
-If you are in the "No" rows, you do not need this library; a simpler lock will do. redlease is for the first row.
+If you are in the "No" rows, a simpler lock will do. redlease is for the first row.
 
 ---
 
@@ -72,7 +72,7 @@ e.Run(ctx, func(leaderCtx context.Context, f redlease.Fencer) {
 })
 ```
 
-All instances that should contend for the same leadership must share the same `Config.Name`. The `Fencer` your work function receives is bound to the term's fencing token — pass it wherever shared state is written, and the token travels with it.
+All instances that should contend for the same leadership must share the same `Config.Name`.
 
 ### Fenced writes
 
@@ -95,7 +95,7 @@ The same writes are available on the elector itself — `e.FenceHSet(ctx, token,
 
 ### Observability
 
-redlease emits **no logs of its own** — a library should not impose a log format, level, or destination on its caller. Instead it exposes leadership transitions through an optional `Observer`; wire them to your own logger, metrics, or tracing. Both fields are optional and a nil one is simply not called.
+redlease emits **no logs of its own** — a library should not impose a log format, level, or destination on its caller. Instead it exposes leadership transitions through an optional `Observer`; wire them to your own logger, metrics, or tracing. Every field is optional and a nil one is simply not called.
 
 ```go
 e, _ := redlease.New(rc, redlease.Config{
@@ -110,7 +110,7 @@ e, _ := redlease.New(rc, redlease.Config{
 
 `OnFollower` fires when an acquire attempt finds the lock held by another instance — once per transition into the follower role, not on every retry. It lets a follower learn its initial role at startup without waiting to win.
 
-Only role transitions are reported, following the design of `client-go`'s `leaderelection`. Transient Redis errors during acquire or renewal are handled internally; the consequence the caller cares about — losing leadership — surfaces through `OnSteppedDown`. Monitor Redis health through your Redis client, not through the `Observer`. Callbacks run on the `Run` goroutine and must not block.
+Only role transitions are reported. Transient Redis errors during acquire or renewal are handled internally; the consequence the caller cares about — losing leadership — surfaces through `OnSteppedDown`. Monitor Redis health through your Redis client, not through the `Observer`. Callbacks run on the `Run` goroutine and must not block.
 
 ### Checking leadership outside the callback
 
@@ -145,7 +145,7 @@ The callback style and this token-driven style are interchangeable — pick whic
 
 ## Fencing writes that don't go to Redis
 
-Fencing is **not a Redis concept** — it applies to any shared resource a stale leader could corrupt (a Postgres row, an S3 object, a Kafka topic). The catch is that the fence must be enforced **at the resource itself**, atomically with the write, because that is the only place the check and the write can happen together.
+Fencing is **not a Redis concept** — it applies to any shared resource a stale leader could corrupt (a Postgres row, an S3 object). The catch is that the fence must be enforced **at the resource itself**, atomically with the write, because that is the only place the check and the write can happen together.
 
 This package enforces the fence for **Redis** writes, because Redis is the resource it can reach into (via Lua). If your leader writes elsewhere, redlease still gives you the universal half — the monotonic token — but you must enforce it at *your* resource. For example, in Postgres:
 
@@ -171,38 +171,7 @@ So redlease is the right tool when:
 - you run Redis **single-instance**, **or**
 - a brief, rare token regression on Redis failover is acceptable for your workload.
 
-If you need a fencing guarantee that survives failover, source the token from a **linearizable** store — etcd or ZooKeeper — and apply it against your resource. redlease deliberately does not pretend Redis can provide that.
-
----
-
-## Election, not a mutex
-
-redlease and a distributed mutex (redsync, redislock) solve different problems with different shapes. Reaching for the wrong one is the classic split-brain footgun — holding a *mutex* across long-running work with no renewal lets the lock expire mid-work.
-
-| | Mutex (redsync, redislock) | Election (redlease) |
-| --- | --- | --- |
-| Mental model | grab lock → short critical section → release | be leader → run long-lived work → step down |
-| You call | `Lock()` … `Unlock()` manually | `Run(ctx, fn)` — lifecycle managed for you |
-| Lock held for | a brief operation | the whole leadership term (often hours) |
-| Renewal | you add it yourself, or the lock expires | built in |
-| Loser of the race | blocks / retries to acquire now | becomes a follower, re-contends in the background |
-| Fencing | none | core feature |
-
-If your lock guards an *operation*, use a mutex. If it confers a *role*, use redlease.
-
----
-
-## When to use something else
-
-| You want… | Use |
-| --- | --- |
-| election + fencing, Redis you already run, single-instance or tolerant of rare failover regressions | **redlease** |
-| a plain distributed mutex for short critical sections | [go-redsync/redsync](https://github.com/go-redsync/redsync) |
-| consensus-grade election and you run on Kubernetes | `k8s.io/client-go/tools/leaderelection` (etcd-backed Lease) |
-| consensus-grade election off Kubernetes | [etcd `concurrency.Election`](https://pkg.go.dev/go.etcd.io/etcd/client/v3/concurrency) |
-| leadership as part of your own replicated state machine | a Raft library ([hashicorp/raft](https://github.com/hashicorp/raft), [etcd/raft](https://github.com/etcd-io/raft)) |
-
-redlease fills one specific gap: the Redis-lock libraries that don't fence, for users whose leader writes shared state where a stale write would do harm.
+If you need a fencing guarantee that survives failover, source the token from a **linearizable** store and apply it against your resource. redlease deliberately does not pretend Redis can provide that.
 
 ---
 
