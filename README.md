@@ -166,6 +166,8 @@ The fencing token is generated and stored **in Redis**. On a **single Redis inst
 
 On a **replicated Redis** deployment (Sentinel or Cluster), Redis replication is **asynchronous**. A primary can acknowledge the acquire — and the token `INCR` — before it has propagated to a replica, and a failover to that replica can lose it. In that window the monotonicity the fence depends on can be violated, and two leaders could in principle obtain non-ordered tokens. This is the same limitation that affects *every* Redis-based lock, fencing or not.
 
+On **Redis Cluster** there is also a separate, non-negotiable requirement: the lock, fence, and applied keys all derive from `Config.Name`, and a single Lua script touches more than one of them, so they must hash to the **same slot**. Wrap `Name` in a hash tag — e.g. `"{report-builder}"` — so every derived key shares it. Without one they scatter across slots and the acquire script fails with `CROSSSLOT`.
+
 So redlease is the right tool when:
 
 - you run Redis **single-instance**, **or**

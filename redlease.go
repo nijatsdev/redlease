@@ -27,6 +27,10 @@
 // token from a linearizable store (etcd, ZooKeeper) instead of Redis. This package
 // is the right tool when you run Redis single-instance, or when a brief, rare token
 // regression on failover is acceptable.
+//
+// On Redis Cluster, also wrap [Config.Name] in a hash tag (e.g. "{name}") so the
+// lock, fence, and applied keys hash to the same slot; otherwise the acquire
+// script fails with CROSSSLOT.
 package redlease
 
 import (
@@ -77,6 +81,12 @@ type Redis interface {
 type Config struct {
 	// Name identifies the lock. All instances contending for the same leadership
 	// must use the same Name; different Names are independent locks.
+	//
+	// The lock, fence, and applied keys all derive from Name, and a single Lua
+	// script touches more than one of them. On Redis Cluster they must therefore
+	// hash to the same slot: wrap Name in a hash tag, e.g. "{report-builder}",
+	// so all derived keys share it. Without one they scatter across slots and the
+	// acquire script fails with CROSSSLOT.
 	Name string
 
 	// TTL is how long the lock lives without renewal. A leader that cannot renew
