@@ -2,7 +2,6 @@
 
 [![CI](https://github.com/nijatsdev/redlease/actions/workflows/ci.yml/badge.svg)](https://github.com/nijatsdev/redlease/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/nijatsdev/redlease.svg)](https://pkg.go.dev/github.com/nijatsdev/redlease)
-[![Go Report Card](https://goreportcard.com/badge/github.com/nijatsdev/redlease)](https://goreportcard.com/report/github.com/nijatsdev/redlease)
 
 Lease-based leader election on Redis, **with fencing tokens**.
 
