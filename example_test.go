@@ -70,6 +70,14 @@ func Example() {
 // The table is assumed to hold a fence column alongside the value:
 //
 //	CREATE TABLE state (id text PRIMARY KEY, value text, fence bigint NOT NULL DEFAULT 0);
+//
+// sql.Open needs a registered driver; a real program imports one, e.g.
+//
+//	import _ "github.com/jackc/pgx/v5/stdlib" // database/sql driver "pgx"
+//
+// The LeaderFunc here performs one write and returns, which ends the term (see
+// [LeaderFunc]); a leader with ongoing work loops until leaderCtx is done, as
+// in the package example above.
 func Example_databaseFencing() {
 	rc := goredis.NewClient(&goredis.Options{Addr: "localhost:6379"})
 
