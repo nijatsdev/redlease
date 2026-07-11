@@ -96,17 +96,24 @@ func (e *Elector) acquireLock(ctx context.Context) (token int64, won bool, err e
 // returns 0 means another instance owns the lock (immediate step-down). A
 // transient Redis error is tolerated until the lock TTL would have lapsed, after
 // which we step down to avoid two leaders.
-func (e *Elector) hold(ctx context.Context) {
+//
+// lastRenew is when the request that last extended the lock was *sent* — for the
+// first iteration, the time captured before the acquire call. The lock's true
+// expiry is anchored at the server-side moment the SET/PEXPIRE applied, which
+// lies between sending the request and seeing the response; anchoring the
+// deadline at send time keeps time.Since(lastRenew) >= ttl a conservative bound,
+// so the leader steps down at or before the lock actually lapses at Redis.
+func (e *Elector) hold(ctx context.Context, lastRenew time.Time) {
 	t := time.NewTicker(e.renew)
 	defer t.Stop()
-
-	lastRenew := time.Now()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+			attemptAt := time.Now()
+
 			n, err := renewScript.Run(ctx, e.client, []string{e.lockKey}, e.id, e.ttlMillis()).Int()
 			switch {
 			case err != nil:
@@ -120,7 +127,7 @@ func (e *Elector) hold(ctx context.Context) {
 			case n == 0:
 				return // lock lost
 			default:
-				lastRenew = time.Now()
+				lastRenew = attemptAt
 			}
 		}
 	}

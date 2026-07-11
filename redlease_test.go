@@ -479,6 +479,45 @@ func TestObserver_FiresOnElectedEachTermWithGreaterToken(t *testing.T) {
 	assert.Greater(t, tokens[1], tokens[0], "each term's fencing token must be strictly greater")
 }
 
+// A leader whose renewals persistently error must step down by the time the
+// lock would have lapsed at Redis. The deadline is anchored at the moment the
+// winning acquire request was sent — the conservative bound for the server-side
+// expiry — not at some later client-side timestamp.
+func TestHold_StepsDownWithinTTLWhenRenewalsFail(t *testing.T) {
+	t.Parallel()
+
+	mr := miniredis.RunT(t)
+
+	// Retries disabled so each failed renewal errors immediately and the timing
+	// assertion below reflects the deadline logic, not client retry backoff.
+	rc := goredis.NewClient(&goredis.Options{Addr: mr.Addr(), MaxRetries: -1})
+
+	t.Cleanup(func() { _ = rc.Close() })
+
+	const (
+		ttl   = 200 * time.Millisecond
+		renew = 50 * time.Millisecond
+	)
+
+	e, err := New(rc, Config{Name: "test", TTL: ttl, RenewInterval: renew, AcquireInterval: renew, InstanceID: "host-a"})
+	require.NoError(t, err)
+
+	acquiredAt := time.Now()
+
+	_, won, err := e.acquireLock(t.Context())
+	require.NoError(t, err)
+	require.True(t, won)
+
+	// Kill Redis so every renewal errors.
+	mr.Close()
+
+	e.hold(t.Context(), acquiredAt)
+
+	elapsed := time.Since(acquiredAt)
+	assert.GreaterOrEqual(t, elapsed, ttl, "leader must tolerate transient errors until the TTL deadline")
+	assert.Less(t, elapsed, ttl+renew+300*time.Millisecond, "leader must step down promptly once the TTL deadline passes")
+}
+
 func TestRun_StepsDownWhenLockStolen(t *testing.T) {
 	t.Parallel()
 

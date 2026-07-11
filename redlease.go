@@ -96,8 +96,9 @@ type Config struct {
 	TTL time.Duration
 
 	// RenewInterval is how often the leader renews the lock. Must be at most
-	// TTL/2, so at least two renewal attempts fit before expiry and a single
-	// dropped renewal does not cost leadership. Defaults to TTL/3.
+	// TTL/2, so at least two renewal attempts fit before expiry. Note that at
+	// exactly TTL/2 the retry after a dropped renewal lands right at expiry;
+	// keep it strictly below TTL/2 (the TTL/3 default) for real retry headroom.
 	RenewInterval time.Duration
 
 	// AcquireInterval is how often a follower retries acquiring the lock. Must be
@@ -188,7 +189,8 @@ func New(client Redis, cfg Config) (*Elector, error) {
 	acquire := orDuration(cfg.AcquireInterval, ttl/defaultAcquireDivisor)
 
 	// Renew must leave room for a retry: at least two attempts should fit before
-	// the lock expires, so a single dropped renewal does not cost leadership.
+	// the lock expires. TTL/2 is the permissive bound; the TTL/3 default leaves
+	// real headroom for the retry to complete before expiry.
 	if renew > ttl/2 {
 		return nil, errors.New("redlease: RenewInterval must be at most TTL/2")
 	}
@@ -284,6 +286,11 @@ func (e *Elector) Run(ctx context.Context, fn LeaderFunc) {
 	wasFollower := false
 
 	for ctx.Err() == nil {
+		// Captured before the acquire request goes out: the lock's TTL starts
+		// counting at the server-side SET, so this is the conservative anchor for
+		// the renewal deadline in hold.
+		acquiredAt := time.Now()
+
 		token, won, err := e.acquireLock(ctx)
 
 		switch {
@@ -295,7 +302,7 @@ func (e *Elector) Run(ctx context.Context, fn LeaderFunc) {
 		case won:
 			wasFollower = false
 
-			e.lead(ctx, token, fn)
+			e.lead(ctx, token, acquiredAt, fn)
 		default:
 			// Lock held by another instance: we are a follower.
 			if !wasFollower {
@@ -318,8 +325,9 @@ func (e *Elector) Run(ctx context.Context, fn LeaderFunc) {
 // context and waits for it to return before releasing, so a successor never
 // starts before the previous holder has fully stopped. When fn is nil, lead
 // simply holds leadership until the lock is lost or ctx is cancelled — the
-// caller drives its work elsewhere via Token / FenceHSet.
-func (e *Elector) lead(ctx context.Context, token int64, fn LeaderFunc) {
+// caller drives its work elsewhere via Token / FenceHSet. acquiredAt is when the
+// winning acquire request was sent; it seeds the renewal deadline in hold.
+func (e *Elector) lead(ctx context.Context, token int64, acquiredAt time.Time, fn LeaderFunc) {
 	e.token.Store(token)
 
 	if e.obs.OnElected != nil {
@@ -327,7 +335,7 @@ func (e *Elector) lead(ctx context.Context, token int64, fn LeaderFunc) {
 	}
 
 	if fn == nil {
-		e.hold(ctx)
+		e.hold(ctx, acquiredAt)
 	} else {
 		leaderCtx, cancel := context.WithCancel(ctx)
 		done := make(chan struct{})
@@ -338,7 +346,7 @@ func (e *Elector) lead(ctx context.Context, token int64, fn LeaderFunc) {
 			fn(leaderCtx, Fencer{e: e, token: token})
 		}()
 
-		e.hold(leaderCtx)
+		e.hold(leaderCtx, acquiredAt)
 		cancel()
 		<-done
 	}
