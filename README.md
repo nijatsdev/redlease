@@ -21,7 +21,7 @@ It is **not** a general-purpose mutex. The litmus test:
 
 One instance holds a Redis lock with a TTL and runs your work while it is leader. If it cannot renew the lock, it steps down so another instance takes over. What redlease adds on top:
 
-**Every leadership term is assigned a strictly increasing fencing token, and writes routed through the `Fence*` helpers reject any token older than the latest applied.** A paused, GC-stalled, or clock-skewed leader that still believes it holds the lock cannot overwrite newer state — its writes are refused at Redis.
+**Every leadership term is assigned a strictly increasing fencing token, and writes routed through the `Fence*` helpers reject any token below the newest elected term or applied write.** A paused, GC-stalled, or clock-skewed leader that still believes it holds the lock cannot overwrite newer state — its writes are refused at Redis from the moment a successor is elected, even before that successor writes anything.
 
 ---
 
@@ -103,13 +103,14 @@ e, _ := redlease.New(rc, redlease.Config{
         OnElected:     func(token int64) { slog.Info("leader elected", "fence", token) },
         OnSteppedDown: func()            { slog.Info("leader stepped down") },
         OnFollower:    func()            { slog.Info("running as follower") },
+        OnError:       func(err error)   { slog.Warn("election redis error", "err", err) },
     },
 })
 ```
 
 `OnFollower` fires when an acquire attempt finds the lock held by another instance — once per transition into the follower role, not on every retry. It lets a follower learn its initial role at startup without waiting to win.
 
-Only role transitions are reported. Transient Redis errors during acquire or renewal are handled internally; the consequence the caller cares about — losing leadership — surfaces through `OnSteppedDown`. Monitor Redis health through your Redis client, not through the `Observer`. Callbacks run on the `Run` goroutine and must not block.
+Role transitions drive behavior. Transient Redis errors during acquire, renewal, or release are handled internally — retried, backed off, or stepped down from — and the consequence the caller cares about, losing leadership, surfaces through `OnSteppedDown`. `OnError` additionally exposes those handled errors for logs and metrics, so you can see trouble (a flaky network, a slow Redis) before it costs leadership; it never requires action. Callbacks run on the `Run` goroutine and must not block.
 
 ### Checking leadership outside the callback
 
@@ -139,11 +140,12 @@ A term ends when leadership is lost, the `LeaderFunc` returns, `ctx` is cancelle
 
 ## How it works
 
-- **Acquire** — a single Lua script does `SET name:leader <id> NX PX <ttl-ms>` and, on success, `INCR name:fence` to mint the token. Doing both atomically guarantees every term's token is strictly greater than any prior term's. A lock left over from a previous term of the *same* instance (a release that never reached Redis, a restart with a fixed `InstanceID`) is taken over immediately — with a refreshed TTL and a fresh token, since it is a new term — instead of waiting out the TTL. The TTL is set in milliseconds so sub-second values are honored exactly.
+- **Acquire** — a single Lua script does `SET name:leader <id> NX PX <ttl-ms>` and, on success, `INCR name:fence` to mint the token and stamps it into `name:fence:applied`. Doing it all atomically guarantees every term's token is strictly greater than any prior term's. A lock left over from a previous term of the *same* instance (a release that never reached Redis, a restart with a fixed `InstanceID`) is taken over immediately — with a refreshed TTL and a fresh token, since it is a new term — instead of waiting out the TTL. The TTL is set in milliseconds so sub-second values are honored exactly.
+  ⚠️ The takeover is why an explicit `InstanceID` must be **unique among live processes**: replicas sharing an ID seize the lock from each other and both run as leader, silently. Derive it from something unique per replica (pod/host name), never the service name.
 - **Contend** — followers poll on `AcquireInterval` with slight downward jitter, so contenders that started together spread out instead of hitting Redis in the same instant. When the acquire round trip errors (Redis unreachable) the retry delay doubles per consecutive error, capped at the TTL, and resets once Redis answers again; losing the race to another instance never backs off, so failover speed is unaffected.
 - **Hold** — the leader renews the lock on `RenewInterval` via an ownership-checked script (it only extends a lock whose value is still its own id). A renewal that returns 0 means the lock was lost; a transient Redis error is tolerated until `TTL` would have lapsed, then the leader steps down.
 - **Release** — on graceful step-down the leader deletes the lock (ownership-checked, so it never deletes a successor's lock), letting the next instance take over without waiting for the TTL.
-- **Fence** — each fenced write runs a Lua script that stores the highest applied token in `name:fence:applied` and rejects any write carrying a lower token, performing the write only when the token is current.
+- **Fence** — each fenced write runs a Lua script that checks the token against the high-water mark in `name:fence:applied`, performing the write only when the token is current. The mark advances on every applied write *and* on every election, so a deposed leader's tokens are dead from the moment a successor is elected.
 
 ## Fencing writes that don't go to Redis
 
@@ -166,9 +168,16 @@ So: use the `Fence*` helpers when you write to Redis; use the token with a condi
 
 The fencing token is generated and stored **in Redis**. On a **single Redis instance**, this gives a strict, monotonic guarantee: tokens never go backward, and the fence is sound.
 
+That strictness assumes the fence keys survive, which puts two requirements on the server:
+
+- **Persistence.** A crash-restart recovers whatever the persistence layer kept. Default RDB snapshotting loses recent writes, so `name:fence` can come back lower — or missing, restarting tokens at 1 — and silently invert the fence against a still-live older term. AOF narrows the window (`appendfsync everysec` to ~1s); only `appendfsync always` makes the counter truly durable.
+- **Eviction.** The fence keys have no TTL, but under `maxmemory-policy allkeys-lru/lfu/random` they are eviction candidates like any key, and eviction resets the counter mid-flight. Run `noeviction` (or a `volatile-*` policy, which never evicts keys without a TTL).
+
 On a **replicated Redis** deployment (Sentinel or Cluster), Redis replication is **asynchronous**. A primary can acknowledge the acquire — and the token `INCR` — before it has propagated to a replica, and a failover to that replica can lose it. In that window the monotonicity the fence depends on can be violated, and two leaders could in principle obtain non-ordered tokens. This is the same limitation that affects *every* Redis-based lock, fencing or not.
 
-On **Redis Cluster** there is also a separate, non-negotiable requirement: the lock, fence, and applied keys all derive from `Config.Name`, and a single Lua script touches more than one of them, so they must hash to the **same slot**. Wrap `Name` in a hash tag — e.g. `"{report-builder}"` — so every derived key shares it. Without one they scatter across slots and the acquire script fails with `CROSSSLOT`.
+On **Redis Cluster** there is also a separate, non-negotiable requirement: the lock, fence, and applied keys all derive from `Config.Name`, and a single Lua script touches more than one of them, so they must hash to the **same slot**. Wrap `Name` in a hash tag — e.g. `"{report-builder}"` — so every derived key shares it. Without one they scatter across slots and the acquire script fails with `CROSSSLOT` — retried forever at the backoff cadence and surfaced only through `Observer.OnError`, so wire `OnError` up before first deploying against Cluster.
+
+The same constraint extends to **fenced writes**: each `Fence*` call runs one script against `name:fence:applied` *and* your target keys, so every key you write through the fence must carry the same hash tag — on Cluster, your fenced application state has to live in the elector's slot. If pinning your data to one slot doesn't fit, enforce the fence at the resource yourself with the raw token (`f.Token()`), exactly as you would for a non-Redis store (see above).
 
 So redlease is the right tool when:
 

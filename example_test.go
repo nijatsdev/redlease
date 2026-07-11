@@ -81,7 +81,7 @@ func Example() {
 func Example_databaseFencing() {
 	rc := goredis.NewClient(&goredis.Options{Addr: "localhost:6379"})
 
-	db, err := sql.Open("postgres", "postgres://localhost/app")
+	db, err := sql.Open("pgx", "postgres://localhost/app")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -110,9 +110,18 @@ func Example_databaseFencing() {
 			return
 		}
 
-		if n, _ := res.RowsAffected(); n == 0 {
+		n, err := res.RowsAffected()
+		if err != nil {
+			log.Printf("rows affected: %v", err)
+			return
+		}
+
+		if n == 0 {
 			// No row updated: a newer leader has advanced the fence past our
-			// token. We are stale and must stop working.
+			// token — we are stale and must stop working. (Zero rows is also
+			// what a missing row yields; this example assumes the row is
+			// seeded. An INSERT ... ON CONFLICT upsert with the same fence
+			// condition covers the first write too.)
 			log.Printf("fenced out by a newer leader; stopping")
 			return
 		}
