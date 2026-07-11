@@ -278,6 +278,96 @@ func TestRun_NilCallback_TokenDrivenStyle(t *testing.T) {
 	assert.False(t, e.IsLeader(), "must not be leader after shutdown")
 }
 
+// Returning from the LeaderFunc ends the term: the lock is released and Run
+// re-contends, rather than holding leadership idle with no work running. The
+// next win is a new term with a strictly greater token.
+func TestRun_LeaderFuncReturnEndsTerm(t *testing.T) {
+	t.Parallel()
+
+	_, rc := newRedis(t)
+	e := newElector(t, rc, "host-a")
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	var calls atomic.Int64
+
+	tokens := make(chan int64, 2)
+
+	go e.Run(ctx, func(leaderCtx context.Context, f Fencer) {
+		tokens <- f.Token()
+
+		if calls.Add(1) == 1 {
+			return // first term ends by returning
+		}
+
+		<-leaderCtx.Done()
+	})
+
+	readToken := func() int64 {
+		select {
+		case tok := <-tokens:
+			return tok
+		case <-time.After(waitFor):
+			t.Fatal("LeaderFunc was not invoked")
+			return 0
+		}
+	}
+
+	first := readToken()
+	second := readToken()
+	assert.Greater(t, second, first, "the term after an early return must be a fresh term with a greater token")
+}
+
+// Resign ends the current term from any goroutine — the essential step-down
+// lever for the token-driven style — and Run then re-contends, so a later term
+// can begin with a fresh token.
+func TestResign_EndsTermAndRecontends(t *testing.T) {
+	t.Parallel()
+
+	_, rc := newRedis(t)
+	e := newElector(t, rc, "host-a")
+
+	// Resign while not leading is a no-op.
+	e.Resign()
+
+	ctx, cancel := context.WithCancel(t.Context())
+
+	exited := make(chan struct{})
+
+	go func() {
+		defer close(exited)
+
+		e.Run(ctx, nil)
+	}()
+
+	require.Eventually(t, e.IsLeader, waitFor, 10*time.Millisecond, "did not become leader")
+
+	first, ok := e.Token()
+	require.True(t, ok)
+
+	e.Resign()
+
+	// The first term ends (token drops to 0) and, the lock being free again,
+	// Run re-contends and wins a fresh term. Waiting for the token to move past
+	// the first term covers both without racing the quick re-election.
+	require.Eventually(t, func() bool { return e.token.Load() != first }, waitFor, 10*time.Millisecond,
+		"Resign must end the current term")
+	require.Eventually(t, e.IsLeader, waitFor, 10*time.Millisecond, "Run must re-contend after Resign")
+
+	second, ok := e.Token()
+	require.True(t, ok)
+	assert.Greater(t, second, first, "the term after Resign must carry a fresh token")
+
+	cancel()
+
+	select {
+	case <-exited:
+	case <-time.After(waitFor):
+		t.Fatal("Run did not exit after context cancel")
+	}
+}
+
 func TestTokenAndIsLeader_TrackLeadership(t *testing.T) {
 	t.Parallel()
 

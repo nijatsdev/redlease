@@ -163,6 +163,12 @@ type Elector struct {
 	// "not leader" sentinel. Read via Token / IsLeader from any goroutine.
 	token atomic.Int64
 
+	// resign points at the current term's cancel function while a term is
+	// running, nil otherwise. Resign loads it to end the term from any
+	// goroutine; a stale load can only cancel an already-finished term's
+	// context, which is harmless.
+	resign atomic.Pointer[context.CancelFunc]
+
 	// evalScripts caches compiled FenceEval scripts keyed by Lua body.
 	evalScripts sync.Map
 }
@@ -250,6 +256,19 @@ func (e *Elector) Fencer() (f Fencer, ok bool) {
 	return Fencer{e: e, token: t}, t != 0
 }
 
+// Resign voluntarily ends the current leadership term, if any: the LeaderFunc's
+// context is cancelled, the lock is released, and Run re-contends after
+// AcquireInterval — so this instance may well win again unless another takes
+// the lock first. It is a no-op when this instance is not leading, and safe to
+// call from any goroutine. It is the step-down lever for the token-driven style
+// (Run with a nil LeaderFunc), which otherwise could stop leading only by
+// cancelling Run's context entirely.
+func (e *Elector) Resign() {
+	if c := e.resign.Load(); c != nil {
+		(*c)()
+	}
+}
+
 // IsLeader reports whether this instance currently holds leadership. It is
 // advisory only: leadership can be lost the instant after it returns, so never
 // gate a correctness-sensitive write on it. For writes, carry the token from
@@ -264,11 +283,16 @@ func (e *Elector) IsLeader() bool {
 // bound to this leadership term — use it for every fenced write, or pass it down
 // to the code that writes shared state. LeaderFunc must return promptly once its
 // context is cancelled; Run does not release the lock or re-contend until it does.
+//
+// Returning also ends the term: holding the lock with no work running would only
+// block other instances, so Run releases it and re-contends. A LeaderFunc that
+// wants to stay leader must block until its context is cancelled.
 type LeaderFunc func(ctx context.Context, f Fencer)
 
 // Run contends for leadership until ctx is cancelled. Each time this instance
 // wins, it invokes fn (a [LeaderFunc]) with a [Fencer] for the term, then steps
-// down and re-contends when leadership is lost. Run blocks until ctx is cancelled
+// down and re-contends when the term ends — leadership lost, fn returned,
+// [Elector.Resign] called, or ctx cancelled. Run blocks until ctx is cancelled
 // and fn (if running) has returned; on the final shutdown step-down the
 // OnSteppedDown observer still fires.
 //
@@ -320,14 +344,19 @@ func (e *Elector) Run(ctx context.Context, fn LeaderFunc) {
 	}
 }
 
-// lead holds the lock for one leadership term, then releases it. When fn is
-// non-nil it runs in its own goroutine with a derived context; lead cancels that
-// context and waits for it to return before releasing, so a successor never
-// starts before the previous holder has fully stopped. When fn is nil, lead
-// simply holds leadership until the lock is lost or ctx is cancelled — the
-// caller drives its work elsewhere via Token / FenceHSet. acquiredAt is when the
+// lead holds the lock for one leadership term, then releases it. The term is
+// scoped by a derived context that ends when leadership is lost, ctx is
+// cancelled, fn returns, or Resign is called. When fn is non-nil it runs in its
+// own goroutine on that context; lead waits for it to return before releasing,
+// so a successor never starts before the previous holder has fully stopped.
+// When fn is nil, lead simply holds leadership until the term ends — the caller
+// drives its work elsewhere via Token / FenceHSet. acquiredAt is when the
 // winning acquire request was sent; it seeds the renewal deadline in hold.
 func (e *Elector) lead(ctx context.Context, token int64, acquiredAt time.Time, fn LeaderFunc) {
+	termCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	e.resign.Store(&cancel)
 	e.token.Store(token)
 
 	if e.obs.OnElected != nil {
@@ -335,21 +364,25 @@ func (e *Elector) lead(ctx context.Context, token int64, acquiredAt time.Time, f
 	}
 
 	if fn == nil {
-		e.hold(ctx, acquiredAt)
+		e.hold(termCtx, acquiredAt)
 	} else {
-		leaderCtx, cancel := context.WithCancel(ctx)
 		done := make(chan struct{})
 
 		go func() {
 			defer close(done)
+			// fn returning ends the term: holding the lock with no work running
+			// would only block other instances.
+			defer cancel()
 
-			fn(leaderCtx, Fencer{e: e, token: token})
+			fn(termCtx, Fencer{e: e, token: token})
 		}()
 
-		e.hold(leaderCtx, acquiredAt)
+		e.hold(termCtx, acquiredAt)
 		cancel()
 		<-done
 	}
+
+	e.resign.Store(nil)
 
 	// Clear the token before releasing so a concurrent Token/IsLeader caller
 	// stops seeing this instance as leader as soon as the work has stopped.

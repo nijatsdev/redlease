@@ -133,6 +133,8 @@ go e.Run(ctx, nil) // hold leadership; do the work elsewhere via e.Token()
 
 The callback style and this token-driven style are interchangeable — pick whichever fits your app.
 
+A term ends when leadership is lost, the `LeaderFunc` returns, `ctx` is cancelled, or you call `e.Resign()`. Resign ends the current term voluntarily — the lock is released and `Run` re-contends — which is the step-down lever for the token-driven style. Note that returning from a `LeaderFunc` also ends the term: a leader that wants to stay elected must block until its context is cancelled.
+
 ---
 
 ## How it works
