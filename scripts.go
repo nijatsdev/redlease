@@ -34,10 +34,9 @@ import (
 // ARGV[1] instance id, ARGV[2] TTL ms.
 var acquireScript = goredis.NewScript(`
 local function win()
-    local applied = tonumber(redis.call('get', KEYS[3]) or '0')
-    local counter = tonumber(redis.call('get', KEYS[2]) or '0')
-    if applied > counter then
-        redis.call('set', KEYS[2], redis.call('get', KEYS[3]))
+    local appliedRaw = redis.call('get', KEYS[3])
+    if tonumber(appliedRaw or '0') > tonumber(redis.call('get', KEYS[2]) or '0') then
+        redis.call('set', KEYS[2], appliedRaw)
     end
     local token = redis.call('incr', KEYS[2])
     redis.call('set', KEYS[3], redis.call('get', KEYS[2]))
@@ -130,62 +129,66 @@ var fenceSetScript = goredis.NewScript(fenceGuard + `
 redis.call('set', KEYS[2], ARGV[2])
 ` + fenceApply)
 
-// acquireLock attempts to take the leader lock. On success it returns the
-// fencing token for this term (a strictly increasing value); won is false when
-// another instance holds the lock.
-//
-// The call carries a deadline of one acquire interval — by then the next
-// attempt is due anyway, so a slower round trip has no value — capped at
-// TTL - RenewInterval: the lock's TTL starts at the server-side SET, which can
-// precede the response by the whole timeout, and a winning term must still fit
-// one renew-bounded round trip inside what remains of the TTL budget (see
-// hold).
-//
-// Like renewOnce, the wait is select-bounded so a client without I/O or
-// context timeouts cannot hang the retry loop or shutdown. An abandoned
-// acquire that wins at the server is harmless: the lock then holds this
-// instance's own id, so the next attempt takes it over (or it lapses at the
-// TTL), and no Fencer for the unknown term exists, so no write can carry its
-// token.
-func (e *Elector) acquireLock(ctx context.Context) (token int64, won bool, err error) {
-	callCtx, cancel := context.WithTimeout(ctx, min(e.acquire, e.ttl-e.renew))
-	defer cancel()
-
+// runBounded runs call on its own goroutine and waits for its result until ctx
+// is done, so a Redis client configured without I/O or context timeouts can
+// block the goroutine but never the caller — stepping down and shutting down
+// on time must not depend on client configuration. A result delivered in a
+// photo-finish with ctx's deadline is preferred over the context error, so a
+// call that completed at the server is never reported as failed. An abandoned
+// call is reaped by ctx's deadline as soon as the client honors contexts.
+func runBounded[T any](ctx context.Context, call func() (T, error)) (T, error) {
 	type result struct {
-		n   int64
+		v   T
 		err error
 	}
 
 	res := make(chan result, 1)
 
 	go func() {
-		n, err := acquireScript.Run(callCtx, e.client, []string{e.lockKey, e.fenceKey, e.appliedKey}, e.id, e.ttlMillis()).Int64()
-		res <- result{n: n, err: err}
+		v, err := call()
+		res <- result{v: v, err: err}
 	}()
 
-	var r result
-
 	select {
-	case r = <-res:
-	case <-callCtx.Done():
-		// As in renewOnce: prefer a result delivered in a photo-finish with
-		// the deadline over the context error.
+	case r := <-res:
+		return r.v, r.err
+	case <-ctx.Done():
 		select {
-		case r = <-res:
+		case r := <-res:
+			return r.v, r.err
 		default:
-			return 0, false, callCtx.Err()
+			var zero T
+
+			return zero, ctx.Err()
 		}
 	}
+}
 
-	if r.err != nil {
-		return 0, false, r.err
+// acquireLock attempts to take the leader lock. On success it returns the
+// fencing token for this term (a strictly increasing value); won is false when
+// another instance holds the lock. The round trip is bounded by
+// Elector.acquireTimeout — see that field for the policy.
+//
+// An abandoned acquire that wins at the server is harmless: the lock then
+// holds this instance's own id, so the next attempt takes it over (or it
+// lapses at the TTL), and no Fencer for the unknown term exists, so no write
+// can carry its token.
+func (e *Elector) acquireLock(ctx context.Context) (token int64, won bool, err error) {
+	callCtx, cancel := context.WithTimeout(ctx, e.acquireTimeout)
+	defer cancel()
+
+	n, err := runBounded(callCtx, func() (int64, error) {
+		return acquireScript.Run(callCtx, e.client, []string{e.lockKey, e.fenceKey, e.appliedKey}, e.id, e.ttlMillis()).Int64()
+	})
+	if err != nil {
+		return 0, false, err
 	}
 
-	if r.n == 0 {
+	if n == 0 {
 		return 0, false, nil
 	}
 
-	return r.n, true, nil
+	return n, true, nil
 }
 
 // hold renews the lock until it is lost or ctx is cancelled. A renewal that
@@ -216,12 +219,12 @@ func (e *Elector) hold(ctx context.Context, lastRenew time.Time) {
 	defer deadline.Stop()
 
 	for {
-		budget := e.ttl - time.Since(lastRenew)
+		attemptAt := time.Now()
+
+		budget := e.ttl - attemptAt.Sub(lastRenew)
 		if budget <= 0 {
 			return // deadline passed; the lock may already have lapsed
 		}
-
-		attemptAt := time.Now()
 
 		n, err := e.renewOnce(ctx, min(e.renew, budget))
 		switch {
@@ -230,11 +233,9 @@ func (e *Elector) hold(ctx context.Context, lastRenew time.Time) {
 				return
 			}
 
+			// Tolerated: the deadline timer in the select below steps down
+			// once the TTL lapses without a successful renewal.
 			e.reportError(err)
-
-			if time.Since(lastRenew) >= e.ttl {
-				return // renewal failing past TTL; step down
-			}
 		case n == 0:
 			return // lock lost
 		default:
@@ -264,59 +265,24 @@ func (e *Elector) hold(ctx context.Context, lastRenew time.Time) {
 	}
 }
 
-// renewOnce sends one ownership-checked renewal and waits for its result for at
-// most timeout — hold passes the renew interval (by then the next attempt is
-// due, so a slower round trip has no value), shortened to the remaining TTL
-// budget when that is smaller. The bound is enforced with a select rather than
-// trusted to the Redis client: a client configured without I/O or context
-// timeouts would otherwise block the hold loop past its step-down deadline, and
-// stepping down on time must not depend on client configuration.
-//
-// A call that outlives its slot counts as a failed attempt and is abandoned;
-// the deadline on its context reaps it as soon as the client honors contexts.
-// An abandoned renewal that later reaches Redis can only extend this instance's
-// own lock (the script is ownership-checked). The subsequent release usually
-// deletes it; at worst a successor waits out the TTL — an availability cost,
-// never a second leader.
+// renewOnce sends one ownership-checked renewal and waits at most timeout for
+// its result. An abandoned renewal that later reaches Redis can only extend
+// this instance's own lock (the script is ownership-checked); the subsequent
+// release usually deletes it, and at worst a successor waits out the TTL — an
+// availability cost, never a second leader.
 func (e *Elector) renewOnce(ctx context.Context, timeout time.Duration) (int, error) {
 	callCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	type result struct {
-		n   int
-		err error
-	}
-
-	res := make(chan result, 1)
-
-	go func() {
-		n, err := renewScript.Run(callCtx, e.client, []string{e.lockKey}, e.id, e.ttlMillis()).Int()
-		res <- result{n: n, err: err}
-	}()
-
-	select {
-	case r := <-res:
-		return r.n, r.err
-	case <-callCtx.Done():
-		// A round trip that finished in a photo-finish with the deadline may
-		// already have delivered its result; prefer it over the context error,
-		// so a renewal that extended the lock at the server is never reported
-		// as failed.
-		select {
-		case r := <-res:
-			return r.n, r.err
-		default:
-			return 0, callCtx.Err()
-		}
-	}
+	return runBounded(callCtx, func() (int, error) {
+		return renewScript.Run(callCtx, e.client, []string{e.lockKey}, e.id, e.ttlMillis()).Int()
+	})
 }
 
 // release deletes the lock if this instance still owns it, so a successor need
 // not wait for the TTL to lapse. Best-effort: on failure the lock simply expires
 // at its TTL, which only delays failover; the failure is reported through
-// OnError. Like renewOnce, the wait is bounded with a select so a client blocked
-// on an unresponsive server cannot stall shutdown; an abandoned delete is
-// ownership-checked and thus always safe.
+// OnError. An abandoned delete is ownership-checked and thus always safe.
 //
 // The bound is one renew interval: release's only value is beating the lock's
 // natural expiry, which a longer wait can never help — it would only slow
@@ -325,26 +291,9 @@ func (e *Elector) release() {
 	ctx, cancel := context.WithTimeout(context.Background(), e.renew)
 	defer cancel()
 
-	res := make(chan error, 1)
-
-	go func() {
-		res <- releaseScript.Run(ctx, e.client, []string{e.lockKey}, e.id).Err()
-	}()
-
-	var err error
-
-	select {
-	case err = <-res:
-	case <-ctx.Done():
-		// As in renewOnce: a delete that finished in a photo-finish with the
-		// deadline may already have delivered its result; prefer it.
-		select {
-		case err = <-res:
-		default:
-			err = ctx.Err()
-		}
-	}
-
+	_, err := runBounded(ctx, func() (struct{}, error) {
+		return struct{}{}, releaseScript.Run(ctx, e.client, []string{e.lockKey}, e.id).Err()
+	})
 	if err != nil {
 		e.reportError(err)
 	}

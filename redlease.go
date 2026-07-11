@@ -209,6 +209,13 @@ type Elector struct {
 	renew   time.Duration
 	acquire time.Duration
 
+	// acquireTimeout bounds each acquire round trip: one acquire interval (by
+	// then the next attempt is due anyway), capped at TTL - RenewInterval —
+	// the lock's TTL starts at the server-side SET, which can precede the
+	// response by the whole timeout, and a winning term must still fit one
+	// renewal inside what remains of the TTL budget (see hold).
+	acquireTimeout time.Duration
+
 	obs Observer
 
 	// token holds the current leadership term's fencing token, or 0 when this
@@ -290,16 +297,17 @@ func New(client Redis, cfg Config) (*Elector, error) {
 	}
 
 	return &Elector{
-		client:      client,
-		lockKey:     cfg.Name + ":leader",
-		fenceKey:    cfg.Name + ":fence",
-		appliedKey:  cfg.Name + ":fence:applied",
-		id:          id,
-		ttl:         ttl,
-		renew:       renew,
-		acquire:     acquire,
-		obs:         cfg.Observer,
-		evalScripts: make(map[string]*goredis.Script),
+		client:         client,
+		lockKey:        cfg.Name + ":leader",
+		fenceKey:       cfg.Name + ":fence",
+		appliedKey:     cfg.Name + ":fence:applied",
+		id:             id,
+		ttl:            ttl,
+		renew:          renew,
+		acquire:        acquire,
+		acquireTimeout: min(acquire, ttl-renew),
+		obs:            cfg.Observer,
+		evalScripts:    make(map[string]*goredis.Script),
 	}, nil
 }
 
