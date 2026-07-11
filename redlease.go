@@ -190,6 +190,12 @@ func New(client Redis, cfg Config) (*Elector, error) {
 		return nil, errors.New("redlease: empty Name")
 	}
 
+	// A negative duration is a configuration mistake, not "unset"; only zero
+	// means "use the default".
+	if cfg.TTL < 0 || cfg.RenewInterval < 0 || cfg.AcquireInterval < 0 {
+		return nil, errors.New("redlease: negative durations are not valid")
+	}
+
 	ttl := orDuration(cfg.TTL, DefaultTTL)
 
 	if ttl < minTTL {
@@ -406,8 +412,10 @@ func (e *Elector) lead(ctx context.Context, token int64, acquiredAt time.Time, f
 	}
 }
 
+// orDuration resolves an optional duration: zero means "unset, use the
+// fallback". Negative values never reach here; New rejects them.
 func orDuration(v, fallback time.Duration) time.Duration {
-	if v <= 0 {
+	if v == 0 {
 		return fallback
 	}
 

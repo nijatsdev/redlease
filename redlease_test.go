@@ -169,6 +169,17 @@ func TestNew_Validation(t *testing.T) {
 	_, err = New(rc, Config{Name: "x", TTL: minTTL, RenewInterval: 20 * time.Millisecond, AcquireInterval: 20 * time.Millisecond})
 	require.NoError(t, err)
 
+	// Negative durations are configuration mistakes, not "unset": rejected
+	// rather than silently replaced with defaults.
+	_, err = New(rc, Config{Name: "x", TTL: -time.Second})
+	require.Error(t, err)
+
+	_, err = New(rc, Config{Name: "x", RenewInterval: -time.Millisecond})
+	require.Error(t, err)
+
+	_, err = New(rc, Config{Name: "x", AcquireInterval: -time.Millisecond})
+	require.Error(t, err)
+
 	// Defaults fill in for zero timing fields.
 	e, err := New(rc, Config{Name: "x"})
 	require.NoError(t, err)
