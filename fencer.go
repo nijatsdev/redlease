@@ -9,10 +9,13 @@ import "context"
 //
 // A Fencer is a small value; copy it freely. Its methods are the bound
 // equivalents of the Elector's Fence* helpers: each applies its write only when
-// the bound token is at least the highest already applied, and returns
-// applied == false when the token is stale (a newer term has written), so the
-// caller can stop. A Fencer is valid only for its term; once leadership is lost,
-// its writes are fenced out like any other stale token.
+// the bound token is at least the fence high-water mark, and returns
+// applied == false when the token is stale (a newer term has been elected or
+// has written), so the caller can stop. A Fencer is valid only for its term:
+// its writes are fenced out once a successor is elected. Between a voluntary
+// step-down and the next election, writes under the old token may still apply
+// (there is no newer state to protect); treat the term context's cancellation,
+// not a failing write, as the signal to stop working.
 type Fencer struct {
 	// e supplies the Redis client and fenced-write scripts. token is pinned to
 	// the term this Fencer was minted for and is not read from e, so an outdated
@@ -24,9 +27,14 @@ type Fencer struct {
 // NewFencer binds an explicit token to e, for callers that already hold a token
 // — for example one persisted from a prior leadership term, or supplied in a
 // test. Most code should instead take the Fencer a [LeaderFunc] receives or call
-// [Elector.Fencer]; reach for this only when the token comes from outside the
-// elector. The token is not validated against the elector's current term: the
-// fence is still enforced at write time, so a stale token is rejected there.
+// [Elector.Fencer]. The token is not validated against the elector's current
+// term (the fence is enforced at write time), but it must originate from this
+// package's electors or stay within their magnitude: the fence comparison is
+// exact only up to 2^53, and stamping an arbitrarily large token would
+// permanently fence out every legitimate writer.
+//
+// e must be non-nil — the Fencer's methods call through it. Likewise a
+// hand-declared zero Fencer{} panics on use; obtain Fencers from the elector.
 func NewFencer(e *Elector, token int64) Fencer {
 	return Fencer{e: e, token: token}
 }

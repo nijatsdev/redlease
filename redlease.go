@@ -5,9 +5,10 @@
 // is leader; if it cannot renew, it steps down so another instance takes over.
 // Unlike a plain Redis lock, every leadership term is assigned a strictly
 // increasing fencing token. Writes routed through the Elector's Fence* helpers
-// are rejected when they carry a token older than the latest applied, so a
-// paused or clock-skewed leader that still believes it holds the lock cannot
-// overwrite newer state.
+// are rejected when they carry a token below the newest elected term or applied
+// write — electing a term fences out its predecessors immediately — so a paused
+// or clock-skewed leader that still believes it holds the lock cannot overwrite
+// newer state.
 //
 // # When you need this
 //
@@ -19,7 +20,11 @@
 // # Correctness boundary
 //
 // The fence token is generated and stored in Redis. On a single Redis instance
-// this gives a strict, monotonic guarantee. On a replicated deployment (Sentinel
+// this gives a strict, monotonic guarantee — provided the fence keys survive:
+// crash-restart durability requires AOF appendfsync always (RDB and AOF
+// everysec lose recent writes), and eviction must not touch the keys (run
+// noeviction or a volatile-* policy; the fence keys carry no TTL). On a
+// replicated deployment (Sentinel
 // or Cluster), Redis replication is asynchronous: a primary can acknowledge the
 // acquire — and the token increment — before it reaches a replica, and a failover
 // to that replica can lose them. In that window the monotonicity the fence relies
@@ -30,7 +35,12 @@
 //
 // On Redis Cluster, also wrap [Config.Name] in a hash tag (e.g. "{name}") so the
 // lock, fence, and applied keys hash to the same slot; otherwise the acquire
-// script fails with CROSSSLOT.
+// script fails with CROSSSLOT. The same constraint extends to fenced writes:
+// each Fence* script touches the applied key and your target keys in one
+// script, so every key written through the fence must carry the same hash tag
+// as Name — on Cluster, fenced application state must live in the elector's
+// slot. If that does not fit your data layout, enforce the fence at the
+// resource yourself using the raw token (see [Elector.Token]).
 package redlease
 
 import (
@@ -69,9 +79,19 @@ const (
 // RenewInterval against a TTL at or above this floor instead.
 const minTTL = 100 * time.Millisecond
 
+// minInterval is the smallest RenewInterval and AcquireInterval [New] accepts.
+// An interval is also its round trip's timeout; below this floor every call
+// times out before Redis can answer and the elector flaps.
+const minInterval = time.Millisecond
+
 // Redis is the subset of the go-redis client this package needs: the script
 // runner used by all lock and fence operations. *goredis.Client and
 // *goredis.ClusterClient both satisfy it, as does any compatible wrapper.
+//
+// Configure the client with sane I/O timeouts: the elector bounds every round
+// trip itself, but a call abandoned past its bound stays blocked inside a
+// timeout-less client, pinning a pooled connection — during a long server hang
+// those accumulate and can starve a shared client.
 type Redis interface {
 	goredis.Scripter
 }
@@ -87,24 +107,29 @@ type Config struct {
 	// script touches more than one of them. On Redis Cluster they must therefore
 	// hash to the same slot: wrap Name in a hash tag, e.g. "{report-builder}",
 	// so all derived keys share it. Without one they scatter across slots and the
-	// acquire script fails with CROSSSLOT.
+	// acquire script fails with CROSSSLOT. Keys written through the Fence*
+	// helpers must carry the same hash tag too; see the package documentation.
 	Name string
 
 	// TTL is how long the lock lives without renewal. A leader that cannot renew
 	// within TTL loses leadership. Shorter TTL means faster failover but less
 	// tolerance for pauses. Must be at least 100ms so a renewal can complete
 	// before expiry. Defaults to DefaultTTL.
+	//
+	// Redis applies the TTL at millisecond granularity (PX), so a fractional
+	// remainder is truncated.
 	TTL time.Duration
 
 	// RenewInterval is how often the leader renews the lock. Must be at most
-	// TTL/2, so at least two renewal attempts fit before expiry. Note that at
-	// exactly TTL/2 the retry after a dropped renewal lands right at expiry;
-	// keep it strictly below TTL/2 (the TTL/3 default) for real retry headroom.
+	// TTL/2, so at least two renewal attempts fit before expiry, and at least
+	// 1ms (it doubles as each renewal's timeout). Note that at exactly TTL/2
+	// the retry after a dropped renewal lands right at expiry; keep it strictly
+	// below TTL/2 (the TTL/3 default) for real retry headroom.
 	RenewInterval time.Duration
 
 	// AcquireInterval is how often a follower retries acquiring the lock. Must be
-	// less than TTL, so a follower polls at least once per lock lifetime.
-	// Defaults to TTL/2.
+	// less than TTL, so a follower polls at least once per lock lifetime, and at
+	// least 1ms, like RenewInterval. Defaults to TTL/2.
 	//
 	// The interval governs the ordinary case of losing the race to another
 	// instance. When the acquire round trip errors instead (Redis unreachable),
@@ -115,6 +140,13 @@ type Config struct {
 	// InstanceID uniquely identifies this instance; it is the lock's value and
 	// guards renewal and release so an instance never affects another's lock. If
 	// empty, a hostname + random suffix is generated.
+	//
+	// The ID must be unique among live processes, not merely stable: a lock
+	// found holding this instance's own ID is treated as its leftover and taken
+	// over, so two live replicas sharing an ID seize the lock from each other
+	// and both run as leader — permanently and silently. Derive a fixed ID from
+	// something unique per replica (pod or host name), never a value shared
+	// across replicas like the service name.
 	InstanceID string
 
 	// Observer receives lifecycle events. All fields are optional; the library
@@ -125,13 +157,17 @@ type Config struct {
 
 // Observer is a set of optional callbacks invoked on leadership transitions. A
 // nil field is simply not called. Callbacks run on the Run goroutine and must
-// not block; offload slow work (I/O, network) to a goroutine of your own.
+// not block — a slow OnElected eats TTL budget before the first renewal and
+// can cost the term. A panicking callback is not recovered (see [LeaderFunc]);
+// OnElected in particular fires while the lock is held, so its panic leaves
+// the lock to expire at the TTL.
 //
-// Only role transitions are reported, mirroring the design of
-// k8s.io/client-go/tools/leaderelection. Transient Redis errors during acquire
-// or renewal are handled internally; their only consequence the caller cares
-// about — losing leadership — surfaces through OnSteppedDown. Monitor Redis
-// health through your Redis client, not through this Observer.
+// Role transitions are the primary events, mirroring the design of
+// k8s.io/client-go/tools/leaderelection: transient Redis errors during
+// acquire, renewal, and release are handled internally — retried, backed off,
+// or stepped down from — and the consequence the caller cares about, losing
+// leadership, surfaces through OnSteppedDown. OnError additionally exposes
+// those handled errors for logging and metrics; it never requires action.
 type Observer struct {
 	// OnElected fires when this instance wins a leadership term, with that
 	// term's fencing token. It fires before the LeaderFunc is invoked.
@@ -147,6 +183,17 @@ type Observer struct {
 	// only after an intervening leadership term — not on every retry. A consumer
 	// can use it to learn its initial role at startup without waiting to win.
 	OnFollower func()
+
+	// OnError fires when a Redis round trip fails during acquire, renewal, or
+	// release. The elector has already handled the failure — retried, backed
+	// off, or stepped down — so the callback exists purely for visibility: wire
+	// it to your logger or metrics to see trouble before it costs leadership.
+	// It is not called for the context cancellation that ends Run.
+	//
+	// Deterministic failures (a missing Cluster hash tag surfacing as
+	// CROSSSLOT, auth errors) are retried forever at the backoff cadence, and
+	// OnError is their only signal — wire it up before first deploying.
+	OnError func(err error)
 }
 
 // Elector runs leader election for a single lock and mints fencing tokens.
@@ -180,14 +227,17 @@ type Elector struct {
 	running atomic.Bool
 
 	// evalScripts caches compiled FenceEval scripts keyed by Lua body, guarded
-	// by evalMu. Initialized in New; entries are never evicted.
+	// by evalMu. Initialized in New; entries are never evicted, and the cache
+	// is capped at maxEvalScripts so interpolated bodies fail loudly instead
+	// of leaking.
 	evalMu      sync.RWMutex
 	evalScripts map[string]*goredis.Script
 }
 
 // New returns an Elector from cfg. It returns an error if required fields are
 // missing or timing parameters are inconsistent: TTL below 100ms, RenewInterval
-// greater than TTL/2, or AcquireInterval not less than TTL.
+// greater than TTL/2, AcquireInterval not less than TTL, or either interval
+// below 1ms.
 func New(client Redis, cfg Config) (*Elector, error) {
 	if client == nil {
 		return nil, errors.New("redlease: nil client")
@@ -203,7 +253,10 @@ func New(client Redis, cfg Config) (*Elector, error) {
 		return nil, errors.New("redlease: negative durations are not valid")
 	}
 
-	ttl := orDuration(cfg.TTL, DefaultTTL)
+	// Redis grants the lease in whole milliseconds (PX); truncate so the
+	// client-side step-down deadline never budgets against precision the
+	// server was not told about.
+	ttl := orDuration(cfg.TTL, DefaultTTL).Truncate(time.Millisecond)
 
 	if ttl < minTTL {
 		return nil, fmt.Errorf("redlease: TTL must be at least %s", minTTL)
@@ -221,6 +274,14 @@ func New(client Redis, cfg Config) (*Elector, error) {
 
 	if acquire >= ttl {
 		return nil, errors.New("redlease: AcquireInterval must be less than TTL")
+	}
+
+	if renew < minInterval {
+		return nil, fmt.Errorf("redlease: RenewInterval must be at least %s", minInterval)
+	}
+
+	if acquire < minInterval {
+		return nil, fmt.Errorf("redlease: AcquireInterval must be at least %s", minInterval)
 	}
 
 	id := cfg.InstanceID
@@ -263,9 +324,11 @@ func (e *Elector) Token() (token int64, ok bool) {
 }
 
 // Fencer returns a [Fencer] bound to the current leadership term and true while
-// this instance is the leader, or a zero Fencer and false otherwise. It is the
-// token-driven-style counterpart to the [Fencer] a [LeaderFunc] receives: code
-// outside the callback can take a Fencer and pass it down to its writers.
+// this instance is the leader, or an inert Fencer and false otherwise — inert
+// meaning it carries token 0, the "not leader" sentinel every fenced write
+// rejects, so even a caller that ignores ok cannot slip a write through. It is
+// the token-driven-style counterpart to the [Fencer] a [LeaderFunc] receives:
+// code outside the callback can take a Fencer and pass it down to its writers.
 //
 // Like [Elector.Token], the returned Fencer is a snapshot; leadership can change
 // immediately after. That is safe because the fence is enforced at write time —
@@ -306,6 +369,11 @@ func (e *Elector) IsLeader() bool {
 // Returning also ends the term: holding the lock with no work running would only
 // block other instances, so Run releases it and re-contends. A LeaderFunc that
 // wants to stay leader must block until its context is cancelled.
+//
+// A panic in a LeaderFunc is not recovered: it crashes the process like any
+// other goroutine panic, and the lock is left to expire at its TTL rather than
+// being released, so failover waits out the TTL. Recover inside your LeaderFunc
+// if you want a panicking term to step down gracefully instead.
 type LeaderFunc func(ctx context.Context, f Fencer)
 
 // Run contends for leadership until ctx is cancelled. Each time this instance
@@ -359,6 +427,8 @@ func (e *Elector) Run(ctx context.Context, fn LeaderFunc) {
 			if ctx.Err() != nil {
 				return
 			}
+
+			e.reportError(err)
 
 			delay = backoff
 			backoff = min(backoff*2, e.ttl)
@@ -433,6 +503,15 @@ func (e *Elector) lead(ctx context.Context, token int64, acquiredAt time.Time, f
 
 	if e.obs.OnSteppedDown != nil {
 		e.obs.OnSteppedDown()
+	}
+}
+
+// reportError forwards a Redis error the elector has already handled to the
+// OnError observer, if set. Like every Observer callback it runs on the Run
+// goroutine.
+func (e *Elector) reportError(err error) {
+	if e.obs.OnError != nil {
+		e.obs.OnError(err)
 	}
 }
 

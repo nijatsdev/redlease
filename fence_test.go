@@ -1,6 +1,7 @@
 package redlease
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -62,6 +63,96 @@ func TestAcquireLock_ReacquiresOwnLeftoverLock(t *testing.T) {
 	_, won, err = eB.acquireLock(t.Context())
 	require.NoError(t, err)
 	assert.False(t, won, "a lock held by a different instance must not be taken over")
+}
+
+// Electing a new term advances the fence high-water mark by itself: a deposed
+// term's token goes stale at the moment of the successor's election, not only
+// once the successor performs its first fenced write. Without this, a paused
+// ex-leader could keep writing arbitrarily long into a new term whose leader
+// writes lazily.
+func TestAcquireLock_ElectionFencesOutPreviousTerm(t *testing.T) {
+	t.Parallel()
+
+	mr, rc := newRedis(t)
+	eA := newElector(t, rc, "host-a")
+
+	tokenA, won, err := eA.acquireLock(t.Context())
+	require.NoError(t, err)
+	require.True(t, won)
+
+	applied, err := eA.FenceHSet(t.Context(), tokenA, "state", "key", "from-A")
+	require.NoError(t, err)
+	require.True(t, applied)
+
+	// A's lease lapses; B is elected and performs no fenced write.
+	mr.Del("test:leader")
+
+	eB := newElector(t, rc, "host-b")
+
+	tokenB, won, err := eB.acquireLock(t.Context())
+	require.NoError(t, err)
+	require.True(t, won)
+	require.Greater(t, tokenB, tokenA)
+
+	// The mark advanced at election, stored verbatim (tokens ran 1 then 2).
+	mark, err := mr.Get("test:fence:applied")
+	require.NoError(t, err)
+	assert.Equal(t, "2", mark, "election must advance the fence high-water mark")
+
+	// A's token is stale immediately — no write from B needed.
+	applied, err = eA.FenceHSet(t.Context(), tokenA, "state", "key", "stale")
+	require.NoError(t, err)
+	assert.False(t, applied, "a deposed term's token must be stale from the moment of election")
+	assert.Equal(t, "from-A", mr.HGet("state", "key"))
+
+	// The new term's own token writes as usual.
+	applied, err = eB.FenceHSet(t.Context(), tokenB, "state", "key", "from-B")
+	require.NoError(t, err)
+	assert.True(t, applied)
+	assert.Equal(t, "from-B", mr.HGet("state", "key"))
+}
+
+// An election must never regress the fence high-water mark. Two ways the mark
+// can be ahead of the counter: the counter was lost (eviction, partial
+// restore) while the mark survived, or a caller stamped an out-of-band token
+// through NewFencer. Winning heals the counter from the mark first, so the new
+// term's token lands strictly above everything ever applied — a regrown
+// counter must not re-admit tokens the fence had already rejected.
+func TestAcquireLock_NeverRegressesHighWaterMark(t *testing.T) {
+	t.Parallel()
+
+	mr, rc := newRedis(t)
+	e := newElector(t, rc, "host-a")
+	ctx := t.Context()
+
+	// An out-of-band token puts the mark far ahead of the counter, which no
+	// election has ever touched.
+	applied, err := e.FenceHSet(ctx, 40, "state", "key", "v40")
+	require.NoError(t, err)
+	require.True(t, applied)
+
+	token, won, err := e.acquireLock(ctx)
+	require.NoError(t, err)
+	require.True(t, won)
+	assert.Equal(t, int64(41), token, "an election must mint strictly above the applied mark")
+
+	mark, err := mr.Get("test:fence:applied")
+	require.NoError(t, err)
+	assert.Equal(t, "41", mark, "the mark must only ever move up")
+
+	applied, err = e.FenceHSet(ctx, 40, "state", "key", "stale")
+	require.NoError(t, err)
+	assert.False(t, applied, "the out-of-band token must stay fenced out after the election")
+
+	// The counter is lost while the mark survives; the next election must heal
+	// the counter from the mark instead of restarting tokens at 1.
+	mr.Del("test:leader")
+	mr.Del("test:fence")
+
+	token, won, err = e.acquireLock(ctx)
+	require.NoError(t, err)
+	require.True(t, won)
+	assert.Equal(t, int64(42), token, "a lost counter must be healed from the surviving mark")
 }
 
 func TestFenceHSet_RejectsStaleToken(t *testing.T) {
@@ -185,6 +276,38 @@ func TestFenceEval_FencesArbitraryWrite(t *testing.T) {
 	assert.InDelta(t, 100.0, score, 0.0001, "fenced-out ZADD must not change state")
 }
 
+// The FenceEval body cache is capped: past maxEvalScripts distinct bodies,
+// FenceEval fails loudly — that many bodies almost certainly means variable
+// data interpolated into the body, which would otherwise leak client memory
+// and Redis's script cache silently and forever. Already-cached bodies keep
+// working at the cap.
+func TestFenceEval_RejectsUnboundedDistinctBodies(t *testing.T) {
+	t.Parallel()
+
+	mr, rc := newRedis(t)
+	e := newElector(t, rc, "host-a")
+	ctx := t.Context()
+
+	// Fill the cache to the cap; compilation alone caches, no Redis needed.
+	for i := range maxEvalScripts {
+		_, err := e.evalScript(fmt.Sprintf("redis.call('set', KEYS[2], %d)", i))
+		require.NoError(t, err)
+	}
+
+	_, err := e.FenceEval(ctx, 1, "redis.call('set', KEYS[2], 'one-too-many')", []string{"k"})
+	require.Error(t, err, "a body past the cap must fail loudly, not leak")
+	require.ErrorIs(t, err, ErrTooManyEvalBodies,
+		"the cap error must be detectable with errors.Is — it is a caller bug, not a transient Redis error")
+
+	applied, err := e.FenceEval(ctx, 1, "redis.call('set', KEYS[2], 0)", []string{"k"})
+	require.NoError(t, err, "an already-cached body must keep working at the cap")
+	assert.True(t, applied)
+
+	val, err := mr.Get("k")
+	require.NoError(t, err)
+	assert.Equal(t, "0", val)
+}
+
 // A fenced write whose body fails at runtime must not advance the high-water
 // mark: Redis scripts keep their earlier effects on a mid-script error (no
 // rollback), so the mark moves only in the epilogue, after the write. A token
@@ -215,6 +338,36 @@ func TestFenceEval_FailedBodyDoesNotAdvanceHighWaterMark(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, applied, "a failed write must not advance the high-water mark")
 	assert.Equal(t, "v6", mr.HGet("state", "key"))
+}
+
+// The high-water mark is stored verbatim — the token string the client sent —
+// never through the Lua engine's number-to-string conversion, whose output
+// varies across Redis versions and reimplementations (scientific notation for
+// round values, "%.14g" truncation under Lua's own tostring). Verbatim storage
+// makes the comparison's 2^53 float bound the only limit, on every engine.
+func TestFence_StoresLargeTokensExactly(t *testing.T) {
+	t.Parallel()
+
+	mr, rc := newRedis(t)
+	e := newElector(t, rc, "host-a")
+	ctx := t.Context()
+
+	const big = int64(1_000_000_000_000_001) // 16 digits: "%.14g" would store "1e+15"
+
+	applied, err := e.FenceHSet(ctx, big, "state", "key", "big")
+	require.NoError(t, err)
+	require.True(t, applied)
+
+	mark, err := mr.Get("test:fence:applied")
+	require.NoError(t, err)
+	assert.Equal(t, "1000000000000001", mark, "the mark must be stored verbatim")
+
+	// A token one below — exactly what the rounded mark would have been — must
+	// be fenced out.
+	applied, err = e.FenceHSet(ctx, big-1, "state", "key", "stale")
+	require.NoError(t, err)
+	assert.False(t, applied, "a token below an exactly-stored mark must be fenced out")
+	assert.Equal(t, "big", mr.HGet("state", "key"))
 }
 
 // A Fencer bound to a term applies its write under that term's token, and is

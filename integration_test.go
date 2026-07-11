@@ -15,6 +15,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -76,17 +77,22 @@ func TestIntegration_AcquireContendRelease(t *testing.T) {
 	require.True(t, won)
 	assert.Equal(t, int64(1), tokenA)
 
+	// Election stamps the new token as the fence high-water mark, verbatim.
+	mark, err := rc.Get(ctx, name+":fence:applied").Result()
+	require.NoError(t, err)
+	assert.Equal(t, "1", mark, "election must advance the fence high-water mark")
+
 	// B cannot acquire while A holds the lock.
 	_, won, err = b.acquireLock(ctx)
 	require.NoError(t, err)
 	assert.False(t, won)
 
 	// A renews its own lock; B cannot renew a lock it does not hold.
-	n, err := a.renewOnce(ctx)
+	n, err := a.renewOnce(ctx, a.renew)
 	require.NoError(t, err)
 	assert.Equal(t, 1, n)
 
-	n, err = b.renewOnce(ctx)
+	n, err = b.renewOnce(ctx, b.renew)
 	require.NoError(t, err)
 	assert.Zero(t, n, "renewal must be ownership-checked")
 
@@ -103,6 +109,79 @@ func TestIntegration_AcquireContendRelease(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, won, "the lock must be free after release")
 	assert.Greater(t, tokenB, tokenA2, "each term must get a strictly greater fencing token")
+}
+
+// The core mint-path invariant under real concurrency: with N instances
+// hammering acquire and release against a real Redis, every won token is
+// globally unique and each instance's successive wins carry strictly
+// increasing tokens. This is exactly what running SET NX and INCR in one
+// atomic script exists to provide; the rest of the suite only ever exercises
+// the mint path sequentially. ("Never two leaders at once" is deliberately
+// not asserted — it is not an invariant lease-based election can promise;
+// the token ordering is.)
+func TestIntegration_ConcurrentContention_TokensUniqueAndIncreasing(t *testing.T) {
+	t.Parallel()
+
+	rc, name := integrationSetup(t)
+
+	const (
+		contenders = 8
+		attempts   = 50
+	)
+
+	// Electors are built on the test goroutine: the helper uses require,
+	// which must not run on spawned goroutines.
+	electors := make([]*Elector, contenders)
+	for i := range electors {
+		electors[i] = integrationElector(t, rc, name, fmt.Sprintf("host-%d", i))
+	}
+
+	var (
+		mu     sync.Mutex
+		tokens []int64
+	)
+
+	var wg sync.WaitGroup
+
+	for i := range contenders {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			e := electors[i]
+
+			var last int64
+
+			for range attempts {
+				token, won, err := e.acquireLock(t.Context())
+				if err != nil || !won {
+					continue
+				}
+
+				assert.Greater(t, token, last, "an instance's successive wins must carry strictly increasing tokens")
+				last = token
+
+				mu.Lock()
+
+				tokens = append(tokens, token)
+				mu.Unlock()
+
+				e.release()
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	require.NotEmpty(t, tokens, "at least some acquire attempts must have won")
+
+	seen := make(map[int64]struct{}, len(tokens))
+	for _, tok := range tokens {
+		_, dup := seen[tok]
+		assert.False(t, dup, "token %d was minted for two different wins", tok)
+		seen[tok] = struct{}{}
+	}
 }
 
 func TestIntegration_FenceSemantics(t *testing.T) {
@@ -142,4 +221,16 @@ func TestIntegration_FenceSemantics(t *testing.T) {
 	applied, err = e.FenceSet(ctx, 6, state, "v6")
 	require.NoError(t, err)
 	assert.True(t, applied, "a failed write must not advance the high-water mark")
+
+	// The counter was never touched by an election, so the applied mark (6) is
+	// ahead of it. Winning must heal the counter from the mark and mint
+	// strictly above everything ever applied, never regress the mark.
+	token, won, err := e.acquireLock(ctx)
+	require.NoError(t, err)
+	require.True(t, won)
+	assert.Equal(t, int64(7), token, "an election must mint above the applied mark")
+
+	mark, err := rc.Get(ctx, name+":fence:applied").Result()
+	require.NoError(t, err)
+	assert.Equal(t, "7", mark, "the mark must only ever move up")
 }
