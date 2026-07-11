@@ -271,6 +271,11 @@ func (e *Elector) FenceSet(ctx context.Context, token int64, key, value string) 
 // fence (the high-water key and the token). Pass your keys in writeKeys and your
 // arguments in args; they appear as KEYS[2..] and ARGV[2..] in that order.
 //
+// Each distinct body compiles once and is cached on the Elector for EVALSHA
+// reuse, and the cache is never evicted. Keep bodies constant and pass variable
+// data through writeKeys and args; interpolating values into the body itself
+// creates a new cache entry (and a new script for Redis to compile) per call.
+//
 // Example — fence a ZADD:
 //
 //	applied, err := e.FenceEval(ctx, token,
@@ -297,18 +302,23 @@ func (e *Elector) FenceEval(ctx context.Context, token int64, body string, write
 // FenceEval calls with the same body keep EVALSHA caching instead of recompiling
 // and re-sending the source each time.
 func (e *Elector) evalScript(body string) *goredis.Script {
-	if s, ok := e.evalScripts.Load(body); ok {
-		if script, ok := s.(*goredis.Script); ok {
-			return script
-		}
+	e.evalMu.RLock()
+	s := e.evalScripts[body]
+	e.evalMu.RUnlock()
+
+	if s != nil {
+		return s
 	}
 
-	s := goredis.NewScript(fenceGuard + "\n" + body + "\n" + fenceApply)
-	actual, _ := e.evalScripts.LoadOrStore(body, s)
+	e.evalMu.Lock()
+	defer e.evalMu.Unlock()
 
-	if script, ok := actual.(*goredis.Script); ok {
-		return script
+	if s := e.evalScripts[body]; s != nil {
+		return s
 	}
+
+	s = goredis.NewScript(fenceGuard + "\n" + body + "\n" + fenceApply)
+	e.evalScripts[body] = s
 
 	return s
 }

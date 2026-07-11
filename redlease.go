@@ -174,8 +174,10 @@ type Elector struct {
 	// would corrupt shared leadership state (token, resign, the lock itself).
 	running atomic.Bool
 
-	// evalScripts caches compiled FenceEval scripts keyed by Lua body.
-	evalScripts sync.Map
+	// evalScripts caches compiled FenceEval scripts keyed by Lua body, guarded
+	// by evalMu. Initialized in New; entries are never evicted.
+	evalMu      sync.RWMutex
+	evalScripts map[string]*goredis.Script
 }
 
 // New returns an Elector from cfg. It returns an error if required fields are
@@ -222,15 +224,16 @@ func New(client Redis, cfg Config) (*Elector, error) {
 	}
 
 	return &Elector{
-		client:     client,
-		lockKey:    cfg.Name + ":leader",
-		fenceKey:   cfg.Name + ":fence",
-		appliedKey: cfg.Name + ":fence:applied",
-		id:         id,
-		ttl:        ttl,
-		renew:      renew,
-		acquire:    acquire,
-		obs:        cfg.Observer,
+		client:      client,
+		lockKey:     cfg.Name + ":leader",
+		fenceKey:    cfg.Name + ":fence",
+		appliedKey:  cfg.Name + ":fence:applied",
+		id:          id,
+		ttl:         ttl,
+		renew:       renew,
+		acquire:     acquire,
+		obs:         cfg.Observer,
+		evalScripts: make(map[string]*goredis.Script),
 	}, nil
 }
 
@@ -427,14 +430,10 @@ func orDuration(v, fallback time.Duration) time.Duration {
 func instanceID() string {
 	host, _ := os.Hostname()
 
+	// crypto/rand.Read never returns an error as of Go 1.24 (this module's
+	// floor); it fills b entirely or the program does not run.
 	b := make([]byte, 8)
-	if _, err := rand.Read(b); err != nil {
-		if host != "" {
-			return host
-		}
-
-		return "unknown"
-	}
+	_, _ = rand.Read(b)
 
 	suffix := hex.EncodeToString(b)
 	if host != "" {
