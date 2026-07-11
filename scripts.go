@@ -48,10 +48,10 @@ end
 `)
 
 // fenceGuard is the Lua prologue shared by every fenced write. It loads the
-// highest applied token, rejects the call when the caller's token (ARGV[1]) is
-// lower, and otherwise advances the high-water mark. The caller's own write
-// follows, so the check and the write execute atomically in one round trip —
-// there is no window in which the token could go stale between them.
+// highest applied token and rejects the call when the caller's token (ARGV[1])
+// is lower. The caller's own write follows, then fenceApply advances the
+// high-water mark; all of it executes atomically in one round trip, so there is
+// no window in which the token could go stale between check and write.
 //
 // Tokens below 1 are always rejected: real tokens start at 1, and 0 is the
 // "not leader" sentinel — exactly what Token and Fencer hand out when this
@@ -63,27 +63,36 @@ end
 // the comparison must never be fed arbitrary caller-supplied magnitudes.
 //
 // KEYS[1] is always the applied-high-water key; ARGV[1] is always the token.
-// Each script appends its own write using the remaining KEYS/ARGV.
+// Each script inserts its own write between fenceGuard and fenceApply using the
+// remaining KEYS/ARGV.
 const fenceGuard = `
 local applied = tonumber(redis.call('get', KEYS[1]) or '0')
 local token = tonumber(ARGV[1])
 if token < 1 or token < applied then
     return 0
 end
+`
+
+// fenceApply is the Lua epilogue shared by every fenced write: it advances the
+// high-water mark and reports the write as applied. It runs after the write,
+// never before — a Redis script that hits a runtime error mid-way keeps its
+// earlier effects (there is no rollback), so advancing the mark first would let
+// a write that then failed fence out older tokens without having written
+// anything.
+const fenceApply = `
 redis.call('set', KEYS[1], token)
+return 1
 `
 
 // fenceHSetScript fences an HSET. KEYS[2] hash, ARGV[2] field, ARGV[3] value.
 var fenceHSetScript = goredis.NewScript(fenceGuard + `
 redis.call('hset', KEYS[2], ARGV[2], ARGV[3])
-return 1
-`)
+` + fenceApply)
 
 // fenceSetScript fences a SET. KEYS[2] key, ARGV[2] value.
 var fenceSetScript = goredis.NewScript(fenceGuard + `
 redis.call('set', KEYS[2], ARGV[2])
-return 1
-`)
+` + fenceApply)
 
 // acquireLock attempts to take the leader lock. On success it returns the
 // fencing token for this term (a strictly increasing value); won is false when
@@ -243,9 +252,10 @@ func (e *Elector) FenceSet(ctx context.Context, token int64, key, value string) 
 // applied and 0 when fenced out.
 //
 // The body must not contain its own return statement: FenceEval appends the
-// fence's "return 1", so a return inside body shadows it and makes the result
-// report applied == false even on a write that ran. Just perform the write and
-// let FenceEval supply the return.
+// fence's epilogue, which advances the token high-water mark and returns 1. A
+// return inside body skips that epilogue, so the result reports
+// applied == false and the mark does not advance even on a write that ran. Just
+// perform the write and let FenceEval supply the return.
 //
 // Within body, the protected token check is already done. Address your own keys
 // and arguments starting at index 2 — KEYS[1] and ARGV[1] are reserved for the
@@ -284,7 +294,7 @@ func (e *Elector) evalScript(body string) *goredis.Script {
 		}
 	}
 
-	s := goredis.NewScript(fenceGuard + "\n" + body + "\nreturn 1\n")
+	s := goredis.NewScript(fenceGuard + "\n" + body + "\n" + fenceApply)
 	actual, _ := e.evalScripts.LoadOrStore(body, s)
 
 	if script, ok := actual.(*goredis.Script); ok {

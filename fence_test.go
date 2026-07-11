@@ -157,6 +157,38 @@ func TestFenceEval_FencesArbitraryWrite(t *testing.T) {
 	assert.InDelta(t, 100.0, score, 0.0001, "fenced-out ZADD must not change state")
 }
 
+// A fenced write whose body fails at runtime must not advance the high-water
+// mark: Redis scripts keep their earlier effects on a mid-script error (no
+// rollback), so the mark moves only in the epilogue, after the write. A token
+// that only ever failed to write must not fence out older, still-valid writers.
+func TestFenceEval_FailedBodyDoesNotAdvanceHighWaterMark(t *testing.T) {
+	t.Parallel()
+
+	mr, rc := newRedis(t)
+	e := newElector(t, rc, "host-a")
+	ctx := t.Context()
+
+	// Term 5 writes; the mark is now 5.
+	applied, err := e.FenceHSet(ctx, 5, "state", "key", "v5")
+	require.NoError(t, err)
+	require.True(t, applied)
+
+	// Term 7 attempts a write that fails at runtime: ZADD against a string key.
+	require.NoError(t, mr.Set("plain", "not-a-zset"))
+
+	_, err = e.FenceEval(ctx, 7,
+		"redis.call('zadd', KEYS[2], ARGV[2], ARGV[3])",
+		[]string{"plain"}, "1", "member")
+	require.Error(t, err, "a WRONGTYPE write must surface as an error")
+
+	// Term 6 must still be able to write: the failed term-7 attempt never
+	// applied anything, so it must not have raised the mark past 6.
+	applied, err = e.FenceHSet(ctx, 6, "state", "key", "v6")
+	require.NoError(t, err)
+	assert.True(t, applied, "a failed write must not advance the high-water mark")
+	assert.Equal(t, "v6", mr.HGet("state", "key"))
+}
+
 // A Fencer bound to a term applies its write under that term's token, and is
 // fenced out once a newer term has advanced the high-water mark. Because a
 // newer-token HSet here fences out a later Set and Eval, this also covers the
