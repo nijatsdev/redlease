@@ -137,7 +137,7 @@ The callback style and this token-driven style are interchangeable — pick whic
 
 ## How it works
 
-- **Acquire** — a single Lua script does `SET name:leader <id> NX PX <ttl-ms>` and, on success, `INCR name:fence` to mint the token. Doing both atomically guarantees every term's token is strictly greater than any prior term's. The TTL is set in milliseconds so sub-second values are honored exactly.
+- **Acquire** — a single Lua script does `SET name:leader <id> NX PX <ttl-ms>` and, on success, `INCR name:fence` to mint the token. Doing both atomically guarantees every term's token is strictly greater than any prior term's. A lock left over from a previous term of the *same* instance (a release that never reached Redis, a restart with a fixed `InstanceID`) is taken over immediately — with a refreshed TTL and a fresh token, since it is a new term — instead of waiting out the TTL. The TTL is set in milliseconds so sub-second values are honored exactly.
 - **Hold** — the leader renews the lock on `RenewInterval` via an ownership-checked script (it only extends a lock whose value is still its own id). A renewal that returns 0 means the lock was lost; a transient Redis error is tolerated until `TTL` would have lapsed, then the leader steps down.
 - **Release** — on graceful step-down the leader deletes the lock (ownership-checked, so it never deletes a successor's lock), letting the next instance take over without waiting for the TTL.
 - **Fence** — each fenced write runs a Lua script that stores the highest applied token in `name:fence:applied` and rejects any write carrying a lower token, performing the write only when the token is current.

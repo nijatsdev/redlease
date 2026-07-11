@@ -14,13 +14,22 @@ import (
 // any term before it, even under concurrent acquire attempts. Returns 0 when the
 // lock is already held by another instance.
 //
+// A lock whose value is this instance's own id — left over from a previous term
+// whose release did not reach Redis, or from a restart with a fixed InstanceID —
+// is taken over rather than waited out: the TTL is refreshed and a fresh token
+// is minted, because it is a new leadership term regardless of who held the lock
+// before, and fenced writes from the dead term must stay rejectable.
+//
 // KEYS[1] lock key, KEYS[2] fence counter. ARGV[1] instance id, ARGV[2] TTL ms.
 var acquireScript = goredis.NewScript(`
 if redis.call('set', KEYS[1], ARGV[1], 'NX', 'PX', ARGV[2]) then
     return redis.call('incr', KEYS[2])
-else
-    return 0
 end
+if redis.call('get', KEYS[1]) == ARGV[1] then
+    redis.call('pexpire', KEYS[1], ARGV[2])
+    return redis.call('incr', KEYS[2])
+end
+return 0
 `)
 
 // renewScript extends the lock TTL only when the stored value matches the

@@ -2,6 +2,7 @@ package redlease
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -34,6 +35,33 @@ func TestAcquireLock_AssignsMonotonicTokens(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, won)
 	assert.Greater(t, token2, token1, "each term must get a strictly greater fencing token")
+}
+
+// A lock left over from a previous term of this same instance — a release that
+// never reached Redis, or a restart with a fixed InstanceID — is taken over
+// immediately rather than waited out to its TTL, and the takeover is a new term:
+// fresh token, refreshed TTL.
+func TestAcquireLock_ReacquiresOwnLeftoverLock(t *testing.T) {
+	t.Parallel()
+
+	mr, rc := newRedis(t)
+	e := newElector(t, rc, "host-a")
+
+	require.NoError(t, mr.Set("test:leader", "host-a"))
+	mr.SetTTL("test:leader", time.Hour)
+
+	token, won, err := e.acquireLock(t.Context())
+	require.NoError(t, err)
+	assert.True(t, won, "an instance must reacquire a lock it still holds instead of waiting out the TTL")
+	assert.Equal(t, int64(1), token, "reacquisition mints a fresh token for the new term")
+	assert.LessOrEqual(t, mr.TTL("test:leader"), testTTL, "reacquisition must refresh the TTL to the configured value")
+
+	// Another instance's lock is still untouchable.
+	eB := newElector(t, rc, "host-b")
+
+	_, won, err = eB.acquireLock(t.Context())
+	require.NoError(t, err)
+	assert.False(t, won, "a lock held by a different instance must not be taken over")
 }
 
 func TestFenceHSet_RejectsStaleToken(t *testing.T) {
