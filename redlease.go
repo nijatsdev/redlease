@@ -39,6 +39,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	mathrand "math/rand/v2"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -338,7 +339,7 @@ func (e *Elector) Run(ctx context.Context, fn LeaderFunc) {
 			}
 		}
 
-		if !sleepOrDone(ctx, e.acquire) {
+		if !sleepOrDone(ctx, jitter(e.acquire)) {
 			return
 		}
 	}
@@ -422,6 +423,15 @@ func instanceID() string {
 	}
 
 	return suffix
+}
+
+// jitter returns d shortened by a random amount of up to 10%, so followers that
+// started in lockstep spread their acquire attempts over a window instead of
+// hitting Redis in the same instant. The perturbation is only ever downward,
+// preserving the validated AcquireInterval < TTL bound (a follower still polls
+// at least once per lock lifetime).
+func jitter(d time.Duration) time.Duration {
+	return d - time.Duration(mathrand.Int64N(int64(d)/10+1))
 }
 
 func sleepOrDone(ctx context.Context, d time.Duration) bool {

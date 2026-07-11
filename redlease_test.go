@@ -175,6 +175,21 @@ func TestNew_Validation(t *testing.T) {
 	assert.NotEmpty(t, e.InstanceID())
 }
 
+// jitter perturbs the acquire interval only downward, by at most 10%: followers
+// spread their polls without ever polling slower than the configured interval,
+// so the AcquireInterval < TTL bound survives.
+func TestJitter_ShortensByAtMostTenPercent(t *testing.T) {
+	t.Parallel()
+
+	const d = 100 * time.Millisecond
+
+	for range 1000 {
+		got := jitter(d)
+		assert.LessOrEqual(t, got, d, "jitter must never lengthen the interval")
+		assert.GreaterOrEqual(t, got, 90*time.Millisecond, "jitter must shorten by at most 10%")
+	}
+}
+
 func TestTTLMillis_PreservesSubSecondPrecision(t *testing.T) {
 	t.Parallel()
 
