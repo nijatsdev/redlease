@@ -53,12 +53,21 @@ end
 // follows, so the check and the write execute atomically in one round trip —
 // there is no window in which the token could go stale between them.
 //
+// Tokens below 1 are always rejected: real tokens start at 1, and 0 is the
+// "not leader" sentinel — exactly what Token and Fencer hand out when this
+// instance is not the leader. Rejecting it here means a caller that ignored the
+// ok result cannot slip an unfenced write through before any leader has written.
+//
+// Tokens pass through Lua's number type (a float64), which is exact for
+// integers up to 2^53 — far beyond any realistic election count, but the reason
+// the comparison must never be fed arbitrary caller-supplied magnitudes.
+//
 // KEYS[1] is always the applied-high-water key; ARGV[1] is always the token.
 // Each script appends its own write using the remaining KEYS/ARGV.
 const fenceGuard = `
 local applied = tonumber(redis.call('get', KEYS[1]) or '0')
 local token = tonumber(ARGV[1])
-if token < applied then
+if token < 1 or token < applied then
     return 0
 end
 redis.call('set', KEYS[1], token)

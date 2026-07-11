@@ -68,6 +68,42 @@ func TestFenceHSet_RejectsStaleToken(t *testing.T) {
 	assert.Equal(t, "newer", mr.HGet("state", "key"))
 }
 
+// Token 0 is the "not leader" sentinel that Token and Fencer return when this
+// instance holds no leadership; the fence must reject it (and anything below 1)
+// even before any leader has ever written, so a caller that ignored the ok
+// result cannot slip an unfenced write through.
+func TestFence_RejectsNonPositiveTokens(t *testing.T) {
+	t.Parallel()
+
+	mr, rc := newRedis(t)
+	e := newElector(t, rc, "host-a")
+	ctx := t.Context()
+
+	// No fenced write has ever happened: the high-water mark is unset.
+	applied, err := e.FenceHSet(ctx, 0, "state", "key", "sentinel")
+	require.NoError(t, err)
+	assert.False(t, applied, "token 0 must be rejected even with no prior writes")
+	assert.Empty(t, mr.HGet("state", "key"))
+
+	applied, err = e.FenceSet(ctx, -3, "note", "negative")
+	require.NoError(t, err)
+	assert.False(t, applied, "negative tokens must be rejected")
+
+	// The zero Fencer an Elector returns while not leader is equally inert.
+	f, ok := e.Fencer()
+	require.False(t, ok)
+
+	applied, err = f.Set(ctx, "note", "not-leader")
+	require.NoError(t, err)
+	assert.False(t, applied, "a not-leader Fencer's writes must be fenced out")
+
+	// A rejected sentinel must not have advanced the high-water mark: the first
+	// real term's token 1 still applies.
+	applied, err = e.FenceHSet(ctx, 1, "state", "key", "first-term")
+	require.NoError(t, err)
+	assert.True(t, applied, "the first real token must still be accepted")
+}
+
 func TestFenceSet_RejectsStaleToken(t *testing.T) {
 	t.Parallel()
 
