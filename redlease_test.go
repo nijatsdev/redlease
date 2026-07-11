@@ -53,6 +53,28 @@ func newElector(t *testing.T, rc *goredis.Client, id string) *Elector {
 	return e
 }
 
+// newElectorAt builds an elector on any Redis implementation with symmetric
+// renew/acquire intervals — the shape every timing-focused test uses.
+func newElectorAt(t *testing.T, client Redis, ttl, interval time.Duration, obs ...Observer) *Elector {
+	t.Helper()
+
+	cfg := Config{
+		Name:            "test",
+		TTL:             ttl,
+		RenewInterval:   interval,
+		AcquireInterval: interval,
+		InstanceID:      "host-a",
+	}
+	if len(obs) > 0 {
+		cfg.Observer = obs[0]
+	}
+
+	e, err := New(client, cfg)
+	require.NoError(t, err)
+
+	return e
+}
+
 // signal is a one-shot, race-safe close used to observe election transitions.
 type signal struct {
 	once sync.Once
@@ -71,29 +93,61 @@ func fired(s *signal, d time.Duration) bool {
 	}
 }
 
-// runElector starts an elector and returns elected/steppedDown signals plus a
-// channel closed when Run exits. It captures the token handed to the leader.
-// The token is atomic, not merely ordered by the elected signal: the signal's
-// close gives happens-before for the first term only, and a mid-test
-// re-election would make a plain write race with the reader.
-func runElector(ctx context.Context, e *Elector) (elected, steppedDown *signal, token *atomic.Int64, exited chan struct{}) {
-	elected, steppedDown = newSignal(), newSignal()
-	token = new(atomic.Int64)
-	exited = make(chan struct{})
+// startRun runs e.Run(fn) on its own goroutine under a test-scoped context and
+// registers a cleanup that cancels it and waits for Run to exit, so no test
+// leaks a live elector. It returns the context's cancel (idempotent, for tests
+// that end the run mid-test) and the channel closed when Run exits.
+func startRun(t *testing.T, e *Elector, fn LeaderFunc) (context.CancelFunc, chan struct{}) {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	exited := make(chan struct{})
 
 	go func() {
 		defer close(exited)
 
-		e.Run(ctx, func(leaderCtx context.Context, f Fencer) {
-			token.Store(f.Token())
-
-			elected.fire()
-			<-leaderCtx.Done()
-			steppedDown.fire()
-		})
+		e.Run(ctx, fn)
 	}()
 
-	return elected, steppedDown, token, exited
+	t.Cleanup(func() {
+		cancel()
+		<-exited
+	})
+
+	return cancel, exited
+}
+
+// waitExited fails the test when Run does not exit promptly after a cancel.
+func waitExited(t *testing.T, exited chan struct{}) {
+	t.Helper()
+
+	select {
+	case <-exited:
+	case <-time.After(waitFor):
+		t.Fatal("Run did not exit after context cancel")
+	}
+}
+
+// runElector starts an elector via startRun and returns elected/steppedDown
+// signals plus the run's cancel and exit channel. It captures the token handed
+// to the leader. The token is atomic, not merely ordered by the elected
+// signal: the signal's close gives happens-before for the first term only, and
+// a mid-test re-election would make a plain write race with the reader.
+func runElector(t *testing.T, e *Elector) (elected, steppedDown *signal, token *atomic.Int64, cancel context.CancelFunc, exited chan struct{}) {
+	t.Helper()
+
+	elected, steppedDown = newSignal(), newSignal()
+	token = new(atomic.Int64)
+
+	cancel, exited = startRun(t, e, func(leaderCtx context.Context, f Fencer) {
+		token.Store(f.Token())
+
+		elected.fire()
+		<-leaderCtx.Done()
+		steppedDown.fire()
+	})
+
+	return elected, steppedDown, token, cancel, exited
 }
 
 // TestRun_DeliversFencerThatWrites exercises the primary path: a real leadership
@@ -106,8 +160,6 @@ func TestRun_DeliversFencerThatWrites(t *testing.T) {
 	mr, rc := newRedis(t)
 	e := newElector(t, rc, "host-a")
 
-	ctx, cancel := context.WithCancel(t.Context())
-
 	type result struct {
 		token   int64
 		applied bool
@@ -115,22 +167,12 @@ func TestRun_DeliversFencerThatWrites(t *testing.T) {
 	}
 
 	got := make(chan result, 1)
-	exited := make(chan struct{})
 
-	go func() {
-		defer close(exited)
+	startRun(t, e, func(leaderCtx context.Context, f Fencer) {
+		applied, err := f.HSet(leaderCtx, "state", "key", "via-callback")
+		got <- result{token: f.Token(), applied: applied, err: err}
 
-		e.Run(ctx, func(leaderCtx context.Context, f Fencer) {
-			applied, err := f.HSet(leaderCtx, "state", "key", "via-callback")
-			got <- result{token: f.Token(), applied: applied, err: err}
-
-			<-leaderCtx.Done()
-		})
-	}()
-
-	t.Cleanup(func() {
-		cancel()
-		<-exited
+		<-leaderCtx.Done()
 	})
 
 	select {
@@ -279,8 +321,7 @@ func TestRun_ElectsAndReleasesLock(t *testing.T) {
 
 	mr, rc := newRedis(t)
 
-	ctx, cancel := context.WithCancel(t.Context())
-	elected, _, token, exited := runElector(ctx, newElector(t, rc, "host-a"))
+	elected, _, token, cancel, exited := runElector(t, newElector(t, rc, "host-a"))
 
 	require.True(t, fired(elected, waitFor), "instance was not elected")
 	assert.Equal(t, int64(1), token.Load(), "first term must get token 1")
@@ -290,12 +331,7 @@ func TestRun_ElectsAndReleasesLock(t *testing.T) {
 	assert.Equal(t, "host-a", val, "lock must be held by the elected instance")
 
 	cancel()
-
-	select {
-	case <-exited:
-	case <-time.After(waitFor):
-		t.Fatal("Run did not exit after context cancel")
-	}
+	waitExited(t, exited)
 
 	// Graceful step-down releases the lock so a successor need not wait for TTL.
 	require.ErrorIs(t, rc.Get(context.Background(), "test:leader").Err(), goredis.Nil,
@@ -308,16 +344,8 @@ func TestRun_NilCallback_TokenDrivenStyle(t *testing.T) {
 	mr, rc := newRedis(t)
 	e := newElector(t, rc, "host-a")
 
-	ctx, cancel := context.WithCancel(t.Context())
-
-	exited := make(chan struct{})
-
 	// No LeaderFunc: Run just keeps us elected; work happens out here.
-	go func() {
-		defer close(exited)
-
-		e.Run(ctx, nil)
-	}()
+	cancel, exited := startRun(t, e, nil)
 
 	// Once elected, the token is reachable via Token and a fenced write works.
 	require.Eventually(t, e.IsLeader, waitFor, 10*time.Millisecond, "did not become leader")
@@ -325,18 +353,13 @@ func TestRun_NilCallback_TokenDrivenStyle(t *testing.T) {
 	token, ok := e.Token()
 	require.True(t, ok)
 
-	applied, err := e.FenceHSet(ctx, token, "state", "key", "value")
+	applied, err := e.FenceHSet(t.Context(), token, "state", "key", "value")
 	require.NoError(t, err)
 	assert.True(t, applied, "fenced write under the held token must apply")
 	assert.Equal(t, "value", mr.HGet("state", "key"))
 
 	cancel()
-
-	select {
-	case <-exited:
-	case <-time.After(waitFor):
-		t.Fatal("Run did not exit after context cancel")
-	}
+	waitExited(t, exited)
 
 	// Lock released on shutdown even with no callback.
 	require.ErrorIs(t, rc.Get(context.Background(), "test:leader").Err(), goredis.Nil,
@@ -353,31 +376,22 @@ func TestRun_PanicsWhenCalledConcurrently(t *testing.T) {
 	_, rc := newRedis(t)
 	e := newElector(t, rc, "host-a")
 
-	ctx, cancel := context.WithCancel(t.Context())
-
-	exited := make(chan struct{})
-
-	go func() {
-		defer close(exited)
-
-		e.Run(ctx, nil)
-	}()
+	cancel, exited := startRun(t, e, nil)
 
 	// Once leader, the first Run is certainly inside its loop.
 	require.Eventually(t, e.IsLeader, waitFor, 10*time.Millisecond, "did not become leader")
 
-	assert.Panics(t, func() { e.Run(ctx, nil) }, "a concurrent Run must panic")
+	assert.Panics(t, func() { e.Run(t.Context(), nil) }, "a concurrent Run must panic")
 
 	cancel()
-
-	select {
-	case <-exited:
-	case <-time.After(waitFor):
-		t.Fatal("Run did not exit after context cancel")
-	}
+	waitExited(t, exited)
 
 	// Sequential reuse stays allowed: a fresh Run after the previous returned.
-	assert.NotPanics(t, func() { e.Run(ctx, nil) }, "a sequential Run must not panic")
+	// A pre-cancelled context makes it return immediately.
+	done, stop := context.WithCancel(t.Context())
+	stop()
+
+	assert.NotPanics(t, func() { e.Run(done, nil) }, "a sequential Run must not panic")
 }
 
 // Returning from the LeaderFunc ends the term: the lock is released and Run
@@ -389,30 +403,18 @@ func TestRun_LeaderFuncReturnEndsTerm(t *testing.T) {
 	_, rc := newRedis(t)
 	e := newElector(t, rc, "host-a")
 
-	ctx, cancel := context.WithCancel(t.Context())
-
 	var calls atomic.Int64
 
 	tokens := make(chan int64, 2)
-	exited := make(chan struct{})
 
-	go func() {
-		defer close(exited)
+	startRun(t, e, func(leaderCtx context.Context, f Fencer) {
+		tokens <- f.Token()
 
-		e.Run(ctx, func(leaderCtx context.Context, f Fencer) {
-			tokens <- f.Token()
+		if calls.Add(1) == 1 {
+			return // first term ends by returning
+		}
 
-			if calls.Add(1) == 1 {
-				return // first term ends by returning
-			}
-
-			<-leaderCtx.Done()
-		})
-	}()
-
-	t.Cleanup(func() {
-		cancel()
-		<-exited
+		<-leaderCtx.Done()
 	})
 
 	readToken := func() int64 {
@@ -442,15 +444,7 @@ func TestResign_EndsTermAndRecontends(t *testing.T) {
 	// Resign while not leading is a no-op.
 	e.Resign()
 
-	ctx, cancel := context.WithCancel(t.Context())
-
-	exited := make(chan struct{})
-
-	go func() {
-		defer close(exited)
-
-		e.Run(ctx, nil)
-	}()
+	cancel, exited := startRun(t, e, nil)
 
 	require.Eventually(t, e.IsLeader, waitFor, 10*time.Millisecond, "did not become leader")
 
@@ -471,12 +465,7 @@ func TestResign_EndsTermAndRecontends(t *testing.T) {
 	assert.Greater(t, second, first, "the term after Resign must carry a fresh token")
 
 	cancel()
-
-	select {
-	case <-exited:
-	case <-time.After(waitFor):
-		t.Fatal("Run did not exit after context cancel")
-	}
+	waitExited(t, exited)
 }
 
 func TestTokenAndIsLeader_TrackLeadership(t *testing.T) {
@@ -492,19 +481,12 @@ func TestTokenAndIsLeader_TrackLeadership(t *testing.T) {
 	assert.False(t, ok)
 	assert.Zero(t, tok)
 
-	ctx, cancel := context.WithCancel(t.Context())
-
 	elected := newSignal()
-	exited := make(chan struct{})
 
-	go func() {
-		defer close(exited)
-
-		e.Run(ctx, func(leaderCtx context.Context, _ Fencer) {
-			elected.fire()
-			<-leaderCtx.Done()
-		})
-	}()
+	cancel, exited := startRun(t, e, func(leaderCtx context.Context, _ Fencer) {
+		elected.fire()
+		<-leaderCtx.Done()
+	})
 
 	require.True(t, fired(elected, waitFor), "instance was not elected")
 
@@ -516,12 +498,7 @@ func TestTokenAndIsLeader_TrackLeadership(t *testing.T) {
 	assert.Equal(t, int64(1), tok, "Token must return the term's fencing token")
 
 	cancel()
-
-	select {
-	case <-exited:
-	case <-time.After(waitFor):
-		t.Fatal("Run did not exit after context cancel")
-	}
+	waitExited(t, exited)
 
 	// After step-down: leadership cleared.
 	assert.False(t, e.IsLeader(), "must not report leader after step-down")
@@ -539,28 +516,15 @@ func TestRun_FollowerTakesOverWhenLeaderExits(t *testing.T) {
 
 	t.Cleanup(func() { _ = rcB.Close() })
 
-	ctxA, cancelA := context.WithCancel(t.Context())
-	electedA, _, tokenA, exitedA := runElector(ctxA, newElector(t, rc, "host-a"))
+	electedA, _, tokenA, cancelA, exitedA := runElector(t, newElector(t, rc, "host-a"))
 	require.True(t, fired(electedA, waitFor), "A was not elected")
 
-	ctxB, cancelB := context.WithCancel(t.Context())
-
-	electedB, _, tokenB, exitedB := runElector(ctxB, newElector(t, rcB, "host-b"))
-
-	t.Cleanup(func() {
-		cancelB()
-		<-exitedB
-	})
+	electedB, _, tokenB, _, _ := runElector(t, newElector(t, rcB, "host-b"))
 
 	assert.False(t, fired(electedB, 300*time.Millisecond), "B led while A still held the lock")
 
 	cancelA()
-
-	select {
-	case <-exitedA:
-	case <-time.After(waitFor):
-		t.Fatal("A did not exit")
-	}
+	waitExited(t, exitedA)
 
 	require.True(t, fired(electedB, waitFor), "B did not take over after A exited")
 	assert.Greater(t, tokenB.Load(), tokenA.Load(), "successor must get a strictly greater fencing token")
@@ -584,33 +548,12 @@ func TestObserver_FiresOnFollowerAgainAfterLosingLeadership(t *testing.T) {
 
 	elected := newSignal()
 
-	e, err := New(rc, Config{
-		Name:            "test",
-		TTL:             testTTL,
-		RenewInterval:   testRenew,
-		AcquireInterval: testAcquire,
-		InstanceID:      "host-b",
-		Observer: Observer{
-			OnFollower: func() { followerCount.Add(1) },
-			OnElected:  func(int64) { elected.fire() },
-		},
+	e := newElectorAt(t, rc, testTTL, testRenew, Observer{
+		OnFollower: func() { followerCount.Add(1) },
+		OnElected:  func(int64) { elected.fire() },
 	})
-	require.NoError(t, err)
 
-	ctx, cancel := context.WithCancel(t.Context())
-
-	exited := make(chan struct{})
-
-	go func() {
-		defer close(exited)
-
-		e.Run(ctx, nil)
-	}()
-
-	t.Cleanup(func() {
-		cancel()
-		<-exited
-	})
+	startRun(t, e, nil)
 
 	// Phase 1 — follower: OnFollower fires once for entering the role.
 	require.Eventually(t, func() bool { return followerCount.Load() == 1 },
@@ -644,37 +587,16 @@ func TestObserver_FiresOnElectedEachTermWithGreaterToken(t *testing.T) {
 		tokens []int64
 	)
 
-	e, err := New(rc, Config{
-		Name:            "test",
-		TTL:             testTTL,
-		RenewInterval:   testRenew,
-		AcquireInterval: testAcquire,
-		InstanceID:      "host-a",
-		Observer: Observer{
-			OnElected: func(token int64) {
-				mu.Lock()
-				defer mu.Unlock()
+	e := newElectorAt(t, rc, testTTL, testRenew, Observer{
+		OnElected: func(token int64) {
+			mu.Lock()
+			defer mu.Unlock()
 
-				tokens = append(tokens, token)
-			},
+			tokens = append(tokens, token)
 		},
 	})
-	require.NoError(t, err)
 
-	ctx, cancel := context.WithCancel(t.Context())
-
-	exited := make(chan struct{})
-
-	go func() {
-		defer close(exited)
-
-		e.Run(ctx, nil)
-	}()
-
-	t.Cleanup(func() {
-		cancel()
-		<-exited
-	})
+	startRun(t, e, nil)
 
 	count := func() int {
 		mu.Lock()
@@ -747,100 +669,130 @@ func blackholeServer(t *testing.T) net.Listener {
 	return ln
 }
 
-// errScripter satisfies the Redis interface and fails every call, counting the
-// attempts — a stand-in for a Redis that is down but fails fast.
+// blackholeClient returns a client aimed at a blackholeServer with no I/O
+// timeouts and no retries: only redlease's own bounds can unblock a call.
+func blackholeClient(t *testing.T) *goredis.Client {
+	t.Helper()
+
+	ln := blackholeServer(t)
+
+	rc := goredis.NewClient(&goredis.Options{
+		Addr:         ln.Addr().String(),
+		DialTimeout:  time.Second,
+		ReadTimeout:  -1,
+		WriteTimeout: -1,
+		MaxRetries:   -1,
+	})
+
+	t.Cleanup(func() { _ = rc.Close() })
+
+	return rc
+}
+
+// holdAgainstDeadRedis acquires the lock, kills Redis so every renewal errors,
+// runs hold to completion, and returns how long the leader held on. Client
+// retries are disabled so each failed renewal errors immediately and the
+// elapsed time reflects the deadline logic, not client retry backoff.
+func holdAgainstDeadRedis(t *testing.T, ttl, renew time.Duration, obs ...Observer) time.Duration {
+	t.Helper()
+
+	mr := miniredis.RunT(t)
+	rc := goredis.NewClient(&goredis.Options{Addr: mr.Addr(), MaxRetries: -1})
+
+	t.Cleanup(func() { _ = rc.Close() })
+
+	e := newElectorAt(t, rc, ttl, renew, obs...)
+
+	acquiredAt := time.Now()
+
+	_, won, err := e.acquireLock(t.Context())
+	require.NoError(t, err)
+	require.True(t, won)
+
+	mr.Close()
+
+	e.hold(t.Context(), acquiredAt)
+
+	return time.Since(acquiredAt)
+}
+
+// scripterStub satisfies the Redis interface by routing every command through
+// fill, which populates the prepared command — SetErr for a failing double,
+// SetVal for a success one — so stubs differ only in that single hook.
+type scripterStub struct {
+	fill func(cmd interface{ SetErr(error) })
+}
+
+func (s scripterStub) cmd(ctx context.Context) *goredis.Cmd {
+	c := goredis.NewCmd(ctx)
+	s.fill(c)
+
+	return c
+}
+
+func (s scripterStub) Eval(ctx context.Context, _ string, _ []string, _ ...any) *goredis.Cmd {
+	return s.cmd(ctx)
+}
+
+func (s scripterStub) EvalSha(ctx context.Context, _ string, _ []string, _ ...any) *goredis.Cmd {
+	return s.cmd(ctx)
+}
+
+func (s scripterStub) EvalRO(ctx context.Context, _ string, _ []string, _ ...any) *goredis.Cmd {
+	return s.cmd(ctx)
+}
+
+func (s scripterStub) EvalShaRO(ctx context.Context, _ string, _ []string, _ ...any) *goredis.Cmd {
+	return s.cmd(ctx)
+}
+
+func (s scripterStub) ScriptExists(ctx context.Context, _ ...string) *goredis.BoolSliceCmd {
+	c := goredis.NewBoolSliceCmd(ctx)
+	s.fill(c)
+
+	return c
+}
+
+func (s scripterStub) ScriptLoad(ctx context.Context, _ string) *goredis.StringCmd {
+	c := goredis.NewStringCmd(ctx)
+	s.fill(c)
+
+	return c
+}
+
+// errScripter fails every call, counting the attempts — a stand-in for a Redis
+// that is down but fails fast.
 type errScripter struct {
+	scripterStub
+
 	calls atomic.Int64
 }
 
-func (s *errScripter) fail(cmd interface{ SetErr(error) }) {
-	s.calls.Add(1)
-	cmd.SetErr(assert.AnError)
+func newErrScripter() *errScripter {
+	s := &errScripter{}
+	s.fill = func(cmd interface{ SetErr(error) }) {
+		s.calls.Add(1)
+		cmd.SetErr(assert.AnError)
+	}
+
+	return s
 }
 
-func (s *errScripter) Eval(ctx context.Context, _ string, _ []string, _ ...any) *goredis.Cmd {
-	cmd := goredis.NewCmd(ctx)
-	s.fail(cmd)
-
-	return cmd
-}
-
-func (s *errScripter) EvalSha(ctx context.Context, _ string, _ []string, _ ...any) *goredis.Cmd {
-	cmd := goredis.NewCmd(ctx)
-	s.fail(cmd)
-
-	return cmd
-}
-
-func (s *errScripter) EvalRO(ctx context.Context, _ string, _ []string, _ ...any) *goredis.Cmd {
-	cmd := goredis.NewCmd(ctx)
-	s.fail(cmd)
-
-	return cmd
-}
-
-func (s *errScripter) EvalShaRO(ctx context.Context, _ string, _ []string, _ ...any) *goredis.Cmd {
-	cmd := goredis.NewCmd(ctx)
-	s.fail(cmd)
-
-	return cmd
-}
-
-func (s *errScripter) ScriptExists(ctx context.Context, _ ...string) *goredis.BoolSliceCmd {
-	cmd := goredis.NewBoolSliceCmd(ctx)
-	s.fail(cmd)
-
-	return cmd
-}
-
-func (s *errScripter) ScriptLoad(ctx context.Context, _ string) *goredis.StringCmd {
-	cmd := goredis.NewStringCmd(ctx)
-	s.fail(cmd)
-
-	return cmd
-}
-
-// okScripter satisfies the Redis interface and replies success instantly — the
+// newOKScripter returns a Redis double that replies success instantly — the
 // timing that maximizes the chance a round trip completes before the caller
 // parks on its select, which is exactly when a self-inflicted context
 // cancellation could race the delivered result.
-type okScripter struct{}
-
-func (okScripter) ok(ctx context.Context) *goredis.Cmd {
-	cmd := goredis.NewCmd(ctx)
-	cmd.SetVal(int64(1))
-
-	return cmd
-}
-
-func (s okScripter) Eval(ctx context.Context, _ string, _ []string, _ ...any) *goredis.Cmd {
-	return s.ok(ctx)
-}
-
-func (s okScripter) EvalSha(ctx context.Context, _ string, _ []string, _ ...any) *goredis.Cmd {
-	return s.ok(ctx)
-}
-
-func (s okScripter) EvalRO(ctx context.Context, _ string, _ []string, _ ...any) *goredis.Cmd {
-	return s.ok(ctx)
-}
-
-func (s okScripter) EvalShaRO(ctx context.Context, _ string, _ []string, _ ...any) *goredis.Cmd {
-	return s.ok(ctx)
-}
-
-func (okScripter) ScriptExists(ctx context.Context, _ ...string) *goredis.BoolSliceCmd {
-	cmd := goredis.NewBoolSliceCmd(ctx)
-	cmd.SetVal([]bool{true})
-
-	return cmd
-}
-
-func (okScripter) ScriptLoad(ctx context.Context, _ string) *goredis.StringCmd {
-	cmd := goredis.NewStringCmd(ctx)
-	cmd.SetVal("sha")
-
-	return cmd
+func newOKScripter() scripterStub {
+	return scripterStub{fill: func(cmd interface{ SetErr(error) }) {
+		switch c := cmd.(type) {
+		case *goredis.Cmd:
+			c.SetVal(int64(1))
+		case *goredis.BoolSliceCmd:
+			c.SetVal([]bool{true})
+		case *goredis.StringCmd:
+			c.SetVal("sha")
+		}
+	}}
 }
 
 // A renewal that succeeded at the server must never be reported as an error:
@@ -851,14 +803,7 @@ func (okScripter) ScriptLoad(ctx context.Context, _ string) *goredis.StringCmd {
 func TestRenewOnce_NeverReportsASuccessfulRenewalAsError(t *testing.T) {
 	t.Parallel()
 
-	e, err := New(okScripter{}, Config{
-		Name:            "test",
-		TTL:             time.Second,
-		RenewInterval:   100 * time.Millisecond,
-		AcquireInterval: 100 * time.Millisecond,
-		InstanceID:      "host-a",
-	})
-	require.NoError(t, err)
+	e := newElectorAt(t, newOKScripter(), time.Second, 100*time.Millisecond)
 
 	for range 20000 {
 		n, err := e.renewOnce(t.Context(), e.renew)
@@ -874,15 +819,8 @@ func TestRelease_NeverReportsASuccessfulDeleteAsError(t *testing.T) {
 
 	var errCount atomic.Int64
 
-	e, err := New(okScripter{}, Config{
-		Name:            "test",
-		TTL:             time.Second,
-		RenewInterval:   100 * time.Millisecond,
-		AcquireInterval: 100 * time.Millisecond,
-		InstanceID:      "host-a",
-		Observer:        Observer{OnError: func(error) { errCount.Add(1) }},
-	})
-	require.NoError(t, err)
+	e := newElectorAt(t, newOKScripter(), time.Second, 100*time.Millisecond,
+		Observer{OnError: func(error) { errCount.Add(1) }})
 
 	for range 5000 {
 		e.release()
@@ -899,16 +837,8 @@ func TestRelease_NeverReportsASuccessfulDeleteAsError(t *testing.T) {
 func TestRun_BacksOffOnConsecutiveAcquireErrors(t *testing.T) {
 	t.Parallel()
 
-	s := &errScripter{}
-
-	e, err := New(s, Config{
-		Name:            "test",
-		TTL:             200 * time.Millisecond,
-		RenewInterval:   50 * time.Millisecond,
-		AcquireInterval: 50 * time.Millisecond,
-		InstanceID:      "host-a",
-	})
-	require.NoError(t, err)
+	s := newErrScripter()
+	e := newElectorAt(t, s, 200*time.Millisecond, 50*time.Millisecond)
 
 	ctx, cancel := context.WithTimeout(t.Context(), 600*time.Millisecond)
 	defer cancel()
@@ -927,17 +857,8 @@ func TestObserver_OnErrorSurfacesAcquireErrors(t *testing.T) {
 
 	var errCount atomic.Int64
 
-	s := &errScripter{}
-
-	e, err := New(s, Config{
-		Name:            "test",
-		TTL:             200 * time.Millisecond,
-		RenewInterval:   50 * time.Millisecond,
-		AcquireInterval: 50 * time.Millisecond,
-		InstanceID:      "host-a",
-		Observer:        Observer{OnError: func(error) { errCount.Add(1) }},
-	})
-	require.NoError(t, err)
+	e := newElectorAt(t, newErrScripter(), 200*time.Millisecond, 50*time.Millisecond,
+		Observer{OnError: func(error) { errCount.Add(1) }})
 
 	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
 	defer cancel()
@@ -950,36 +871,12 @@ func TestObserver_OnErrorSurfacesAcquireErrors(t *testing.T) {
 func TestObserver_OnErrorSurfacesRenewalErrors(t *testing.T) {
 	t.Parallel()
 
-	mr := miniredis.RunT(t)
-
-	// Retries disabled so each failed renewal errors immediately.
-	rc := goredis.NewClient(&goredis.Options{Addr: mr.Addr(), MaxRetries: -1})
-
-	t.Cleanup(func() { _ = rc.Close() })
-
 	var errCount atomic.Int64
 
-	e, err := New(rc, Config{
-		Name:            "test",
-		TTL:             200 * time.Millisecond,
-		RenewInterval:   50 * time.Millisecond,
-		AcquireInterval: 50 * time.Millisecond,
-		InstanceID:      "host-a",
-		Observer:        Observer{OnError: func(error) { errCount.Add(1) }},
-	})
-	require.NoError(t, err)
-
-	acquiredAt := time.Now()
-
-	_, won, err := e.acquireLock(t.Context())
-	require.NoError(t, err)
-	require.True(t, won)
-
-	// Kill Redis so every renewal errors; hold reports each through OnError
-	// while tolerating them until the TTL deadline.
-	mr.Close()
-
-	e.hold(t.Context(), acquiredAt)
+	// hold reports every failed renewal through OnError while tolerating them
+	// until the TTL deadline.
+	holdAgainstDeadRedis(t, 200*time.Millisecond, 50*time.Millisecond,
+		Observer{OnError: func(error) { errCount.Add(1) }})
 
 	assert.Positive(t, errCount.Load(), "renewal errors must surface through OnError")
 }
@@ -992,27 +889,11 @@ func TestObserver_OnErrorSurfacesRenewalErrors(t *testing.T) {
 func TestAcquireLock_BoundedAgainstUnresponsiveServer(t *testing.T) {
 	t.Parallel()
 
-	ln := blackholeServer(t)
-
-	// No I/O timeouts and no retries: only redlease's own bound can unblock.
-	rc := goredis.NewClient(&goredis.Options{
-		Addr:         ln.Addr().String(),
-		DialTimeout:  time.Second,
-		ReadTimeout:  -1,
-		WriteTimeout: -1,
-		MaxRetries:   -1,
-	})
-
-	t.Cleanup(func() { _ = rc.Close() })
-
-	const interval = 100 * time.Millisecond
-
-	e, err := New(rc, Config{Name: "test", TTL: time.Second, RenewInterval: interval, AcquireInterval: interval, InstanceID: "host-a"})
-	require.NoError(t, err)
+	e := newElectorAt(t, blackholeClient(t), time.Second, 100*time.Millisecond)
 
 	start := time.Now()
 
-	_, _, err = e.acquireLock(t.Context())
+	_, _, err := e.acquireLock(t.Context())
 	require.Error(t, err, "acquire against an unresponsive server must fail, not hang")
 	assert.Less(t, time.Since(start), waitFor, "acquire must be bounded by its interval, not block indefinitely")
 }
@@ -1024,27 +905,11 @@ func TestAcquireLock_BoundedAgainstUnresponsiveServer(t *testing.T) {
 func TestRenewOnce_BoundedAgainstUnresponsiveServer(t *testing.T) {
 	t.Parallel()
 
-	ln := blackholeServer(t)
-
-	// No I/O timeouts and no retries: only redlease's own bound can unblock.
-	rc := goredis.NewClient(&goredis.Options{
-		Addr:         ln.Addr().String(),
-		DialTimeout:  time.Second,
-		ReadTimeout:  -1,
-		WriteTimeout: -1,
-		MaxRetries:   -1,
-	})
-
-	t.Cleanup(func() { _ = rc.Close() })
-
-	const renew = 100 * time.Millisecond
-
-	e, err := New(rc, Config{Name: "test", TTL: time.Second, RenewInterval: renew, AcquireInterval: renew, InstanceID: "host-a"})
-	require.NoError(t, err)
+	e := newElectorAt(t, blackholeClient(t), time.Second, 100*time.Millisecond)
 
 	start := time.Now()
 
-	_, err = e.renewOnce(t.Context(), renew)
+	_, err := e.renewOnce(t.Context(), e.renew)
 	require.Error(t, err, "renewal against an unresponsive server must fail, not hang")
 	assert.Less(t, time.Since(start), waitFor, "renewal must be bounded by the renew interval, not block indefinitely")
 }
@@ -1056,34 +921,10 @@ func TestRenewOnce_BoundedAgainstUnresponsiveServer(t *testing.T) {
 func TestHold_StepsDownWithinTTLWhenRenewalsFail(t *testing.T) {
 	t.Parallel()
 
-	mr := miniredis.RunT(t)
+	const ttl = 200 * time.Millisecond
 
-	// Retries disabled so each failed renewal errors immediately and the timing
-	// assertion below reflects the deadline logic, not client retry backoff.
-	rc := goredis.NewClient(&goredis.Options{Addr: mr.Addr(), MaxRetries: -1})
+	elapsed := holdAgainstDeadRedis(t, ttl, 50*time.Millisecond)
 
-	t.Cleanup(func() { _ = rc.Close() })
-
-	const (
-		ttl   = 200 * time.Millisecond
-		renew = 50 * time.Millisecond
-	)
-
-	e, err := New(rc, Config{Name: "test", TTL: ttl, RenewInterval: renew, AcquireInterval: renew, InstanceID: "host-a"})
-	require.NoError(t, err)
-
-	acquiredAt := time.Now()
-
-	_, won, err := e.acquireLock(t.Context())
-	require.NoError(t, err)
-	require.True(t, won)
-
-	// Kill Redis so every renewal errors.
-	mr.Close()
-
-	e.hold(t.Context(), acquiredAt)
-
-	elapsed := time.Since(acquiredAt)
 	assert.GreaterOrEqual(t, elapsed, ttl, "leader must tolerate transient errors until the TTL deadline")
 	assert.Less(t, elapsed, ttl+300*time.Millisecond, "leader must step down at the TTL deadline, not a tick later")
 }
@@ -1096,33 +937,13 @@ func TestHold_StepsDownWithinTTLWhenRenewalsFail(t *testing.T) {
 func TestHold_StepsDownAtDeadlineNotAtNextTick(t *testing.T) {
 	t.Parallel()
 
-	mr := miniredis.RunT(t)
-
-	// Retries disabled so each failed renewal errors immediately.
-	rc := goredis.NewClient(&goredis.Options{Addr: mr.Addr(), MaxRetries: -1})
-
-	t.Cleanup(func() { _ = rc.Close() })
-
 	const (
 		ttl   = 600 * time.Millisecond
 		renew = 250 * time.Millisecond
 	)
 
-	e, err := New(rc, Config{Name: "test", TTL: ttl, RenewInterval: renew, AcquireInterval: renew, InstanceID: "host-a"})
-	require.NoError(t, err)
+	elapsed := holdAgainstDeadRedis(t, ttl, renew)
 
-	acquiredAt := time.Now()
-
-	_, won, err := e.acquireLock(t.Context())
-	require.NoError(t, err)
-	require.True(t, won)
-
-	// Kill Redis so every renewal errors.
-	mr.Close()
-
-	e.hold(t.Context(), acquiredAt)
-
-	elapsed := time.Since(acquiredAt)
 	assert.GreaterOrEqual(t, elapsed, ttl, "leader must tolerate transient errors until the TTL deadline")
 	assert.Less(t, elapsed, ttl+renew/2, "step-down must fire at the deadline itself, not wait out the next tick")
 }
@@ -1136,13 +957,9 @@ func TestHold_RenewsImmediatelyOnEntry(t *testing.T) {
 
 	mr, rc := newRedis(t)
 
-	const (
-		ttl   = 2 * time.Second
-		renew = time.Second
-	)
+	const renew = time.Second
 
-	e, err := New(rc, Config{Name: "test", TTL: ttl, RenewInterval: renew, AcquireInterval: renew, InstanceID: "host-a"})
-	require.NoError(t, err)
+	e := newElectorAt(t, rc, 2*time.Second, renew)
 
 	_, won, err := e.acquireLock(t.Context())
 	require.NoError(t, err)
@@ -1201,14 +1018,7 @@ func TestRun_StepsDownWhenLockStolen(t *testing.T) {
 
 	mr, rc := newRedis(t)
 
-	ctx, cancel := context.WithCancel(t.Context())
-
-	elected, steppedDown, _, exited := runElector(ctx, newElector(t, rc, "host-a"))
-
-	t.Cleanup(func() {
-		cancel()
-		<-exited
-	})
+	elected, steppedDown, _, _, _ := runElector(t, newElector(t, rc, "host-a"))
 
 	require.True(t, fired(elected, waitFor), "instance was not elected")
 
@@ -1242,33 +1052,17 @@ func TestObserver_SteppedDownFiresAfterLeadership(t *testing.T) {
 
 	elected := newSignal()
 
-	e, err := New(rc, Config{
-		Name:            "test",
-		TTL:             testTTL,
-		RenewInterval:   testRenew,
-		AcquireInterval: testAcquire,
-		InstanceID:      "host-a",
-		Observer: Observer{
-			OnElected: func(int64) { elected.fire() },
-			OnSteppedDown: func() {
-				mu.Lock()
-				defer mu.Unlock()
+	e := newElectorAt(t, rc, testTTL, testRenew, Observer{
+		OnElected: func(int64) { elected.fire() },
+		OnSteppedDown: func() {
+			mu.Lock()
+			defer mu.Unlock()
 
-				steppedDown = true
-			},
+			steppedDown = true
 		},
 	})
-	require.NoError(t, err)
 
-	ctx, cancel := context.WithCancel(t.Context())
-
-	exited := make(chan struct{})
-
-	go func() {
-		defer close(exited)
-
-		e.Run(ctx, func(leaderCtx context.Context, _ Fencer) { <-leaderCtx.Done() })
-	}()
+	cancel, exited := startRun(t, e, func(leaderCtx context.Context, _ Fencer) { <-leaderCtx.Done() })
 
 	require.True(t, fired(elected, waitFor), "OnElected did not fire")
 
@@ -1277,12 +1071,7 @@ func TestObserver_SteppedDownFiresAfterLeadership(t *testing.T) {
 	mu.Unlock()
 
 	cancel()
-
-	select {
-	case <-exited:
-	case <-time.After(waitFor):
-		t.Fatal("Run did not exit after context cancel")
-	}
+	waitExited(t, exited)
 
 	mu.Lock()
 	defer mu.Unlock()
