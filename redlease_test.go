@@ -2,6 +2,7 @@ package redlease
 
 import (
 	"context"
+	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -477,6 +478,80 @@ func TestObserver_FiresOnElectedEachTermWithGreaterToken(t *testing.T) {
 	defer mu.Unlock()
 
 	assert.Greater(t, tokens[1], tokens[0], "each term's fencing token must be strictly greater")
+}
+
+// blackholeServer accepts TCP connections and never responds — a stand-in for a
+// network partition or a hung server. Accepted connections are closed on test
+// cleanup so blocked client reads unwind.
+func blackholeServer(t *testing.T) net.Listener {
+	t.Helper()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	var (
+		mu    sync.Mutex
+		conns []net.Conn
+	)
+
+	t.Cleanup(func() {
+		_ = ln.Close()
+
+		mu.Lock()
+		defer mu.Unlock()
+
+		for _, c := range conns {
+			_ = c.Close()
+		}
+	})
+
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+
+			mu.Lock()
+
+			conns = append(conns, c)
+			mu.Unlock()
+		}
+	}()
+
+	return ln
+}
+
+// A renewal against an unresponsive server must fail within one renew interval
+// even when the Redis client is configured with no I/O timeouts and does not
+// honor context deadlines: stepping down on time must not depend on client
+// configuration.
+func TestRenewOnce_BoundedAgainstUnresponsiveServer(t *testing.T) {
+	t.Parallel()
+
+	ln := blackholeServer(t)
+
+	// No I/O timeouts and no retries: only redlease's own bound can unblock.
+	rc := goredis.NewClient(&goredis.Options{
+		Addr:         ln.Addr().String(),
+		DialTimeout:  time.Second,
+		ReadTimeout:  -1,
+		WriteTimeout: -1,
+		MaxRetries:   -1,
+	})
+
+	t.Cleanup(func() { _ = rc.Close() })
+
+	const renew = 100 * time.Millisecond
+
+	e, err := New(rc, Config{Name: "test", TTL: time.Second, RenewInterval: renew, AcquireInterval: renew, InstanceID: "host-a"})
+	require.NoError(t, err)
+
+	start := time.Now()
+
+	_, err = e.renewOnce(t.Context())
+	require.Error(t, err, "renewal against an unresponsive server must fail, not hang")
+	assert.Less(t, time.Since(start), waitFor, "renewal must be bounded by the renew interval, not block indefinitely")
 }
 
 // A leader whose renewals persistently error must step down by the time the
