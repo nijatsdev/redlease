@@ -9,7 +9,7 @@ Lease-based leader election on Redis, **with fencing tokens**.
 go get github.com/nijatsdev/redlease
 ```
 
-> Pre-1.0: the API may change between `v0.x` releases.
+> `v1` is stable: the API follows [semantic versioning](https://semver.org), so no breaking changes within `v1.x`.
 
 redlease elects **one long-lived leader** among instances and keeps it elected — for a singleton background job, a scheduler, a cron-like task, or the single writer in a one-writer-many-readers system. It manages the whole leadership lifecycle: acquire, renew, step down, release, and fail over.
 
