@@ -105,6 +105,11 @@ type Config struct {
 	// AcquireInterval is how often a follower retries acquiring the lock. Must be
 	// less than TTL, so a follower polls at least once per lock lifetime.
 	// Defaults to TTL/2.
+	//
+	// The interval governs the ordinary case of losing the race to another
+	// instance. When the acquire round trip errors instead (Redis unreachable),
+	// the retry delay doubles per consecutive error, capped at TTL, and resets
+	// once Redis answers again.
 	AcquireInterval time.Duration
 
 	// InstanceID uniquely identifies this instance; it is the lock's value and
@@ -330,6 +335,15 @@ func (e *Elector) Run(ctx context.Context, fn LeaderFunc) {
 	// on every losing retry. A leadership term resets it.
 	wasFollower := false
 
+	// backoff is the delay applied to the next attempt after a failed acquire
+	// round trip (a Redis error, not a lost race). It starts at the acquire
+	// interval and doubles per consecutive error, capped at the TTL, so an
+	// unreachable Redis is not hammered at full cadence while recovery is still
+	// noticed within about one lock lifetime. Any round trip that reaches Redis
+	// — won or follower — resets it, and losing the race never backs off:
+	// polling slower than the acquire interval would slow failover.
+	backoff := e.acquire
+
 	for ctx.Err() == nil {
 		// Captured before the acquire request goes out: the lock's TTL starts
 		// counting at the server-side SET, so this is the conservative anchor for
@@ -338,17 +352,24 @@ func (e *Elector) Run(ctx context.Context, fn LeaderFunc) {
 
 		token, won, err := e.acquireLock(ctx)
 
+		delay := e.acquire
+
 		switch {
 		case err != nil:
 			if ctx.Err() != nil {
 				return
 			}
-			// Transient acquire failure; back off and retry.
+
+			delay = backoff
+			backoff = min(backoff*2, e.ttl)
 		case won:
 			wasFollower = false
+			backoff = e.acquire
 
 			e.lead(ctx, token, acquiredAt, fn)
 		default:
+			backoff = e.acquire
+
 			// Lock held by another instance: we are a follower.
 			if !wasFollower {
 				wasFollower = true
@@ -359,7 +380,7 @@ func (e *Elector) Run(ctx context.Context, fn LeaderFunc) {
 			}
 		}
 
-		if !sleepOrDone(ctx, jitter(e.acquire)) {
+		if !sleepOrDone(ctx, jitter(delay)) {
 			return
 		}
 	}

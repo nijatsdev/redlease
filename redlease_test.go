@@ -674,6 +674,88 @@ func blackholeServer(t *testing.T) net.Listener {
 	return ln
 }
 
+// errScripter satisfies the Redis interface and fails every call, counting the
+// attempts — a stand-in for a Redis that is down but fails fast.
+type errScripter struct {
+	calls atomic.Int64
+}
+
+func (s *errScripter) fail(cmd interface{ SetErr(error) }) {
+	s.calls.Add(1)
+	cmd.SetErr(assert.AnError)
+}
+
+func (s *errScripter) Eval(ctx context.Context, _ string, _ []string, _ ...any) *goredis.Cmd {
+	cmd := goredis.NewCmd(ctx)
+	s.fail(cmd)
+
+	return cmd
+}
+
+func (s *errScripter) EvalSha(ctx context.Context, _ string, _ []string, _ ...any) *goredis.Cmd {
+	cmd := goredis.NewCmd(ctx)
+	s.fail(cmd)
+
+	return cmd
+}
+
+func (s *errScripter) EvalRO(ctx context.Context, _ string, _ []string, _ ...any) *goredis.Cmd {
+	cmd := goredis.NewCmd(ctx)
+	s.fail(cmd)
+
+	return cmd
+}
+
+func (s *errScripter) EvalShaRO(ctx context.Context, _ string, _ []string, _ ...any) *goredis.Cmd {
+	cmd := goredis.NewCmd(ctx)
+	s.fail(cmd)
+
+	return cmd
+}
+
+func (s *errScripter) ScriptExists(ctx context.Context, _ ...string) *goredis.BoolSliceCmd {
+	cmd := goredis.NewBoolSliceCmd(ctx)
+	s.fail(cmd)
+
+	return cmd
+}
+
+func (s *errScripter) ScriptLoad(ctx context.Context, _ string) *goredis.StringCmd {
+	cmd := goredis.NewStringCmd(ctx)
+	s.fail(cmd)
+
+	return cmd
+}
+
+// Consecutive acquire errors back off exponentially (capped at TTL) instead of
+// retrying at the full acquire cadence: with acquire = 50ms and TTL = 200ms the
+// retry delays run 50, 100, 200, 200, ... ms, so a 600ms window sees about 5
+// attempts where fixed-cadence polling would fire roughly 12. The generous
+// upper bound keeps the assertion meaningful without being timing-sensitive.
+func TestRun_BacksOffOnConsecutiveAcquireErrors(t *testing.T) {
+	t.Parallel()
+
+	s := &errScripter{}
+
+	e, err := New(s, Config{
+		Name:            "test",
+		TTL:             200 * time.Millisecond,
+		RenewInterval:   50 * time.Millisecond,
+		AcquireInterval: 50 * time.Millisecond,
+		InstanceID:      "host-a",
+	})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 600*time.Millisecond)
+	defer cancel()
+
+	e.Run(ctx, nil)
+
+	calls := s.calls.Load()
+	assert.GreaterOrEqual(t, calls, int64(2), "Run must keep retrying through errors")
+	assert.LessOrEqual(t, calls, int64(8), "consecutive errors must back off, not poll at full cadence")
+}
+
 // A renewal against an unresponsive server must fail within one renew interval
 // even when the Redis client is configured with no I/O timeouts and does not
 // honor context deadlines: stepping down on time must not depend on client
