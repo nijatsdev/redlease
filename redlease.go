@@ -170,6 +170,10 @@ type Elector struct {
 	// context, which is harmless.
 	resign atomic.Pointer[context.CancelFunc]
 
+	// running guards against concurrent Run calls on the same Elector, which
+	// would corrupt shared leadership state (token, resign, the lock itself).
+	running atomic.Bool
+
 	// evalScripts caches compiled FenceEval scripts keyed by Lua body.
 	evalScripts sync.Map
 }
@@ -303,8 +307,15 @@ type LeaderFunc func(ctx context.Context, f Fencer)
 // callback style and this one are interchangeable, pick whichever fits.
 //
 // Run must not be called more than once concurrently on the same Elector; the
-// two calls would corrupt shared leadership state. Use one Elector per Run.
+// two calls would corrupt shared leadership state. A concurrent call panics.
+// Use one Elector per Run. Sequential calls (a new Run after a previous one
+// returned) are fine.
 func (e *Elector) Run(ctx context.Context, fn LeaderFunc) {
+	if !e.running.CompareAndSwap(false, true) {
+		panic("redlease: Run called concurrently on the same Elector; use one Elector per Run")
+	}
+	defer e.running.Store(false)
+
 	// wasFollower tracks whether OnFollower has already fired for the current
 	// follower stretch, so it fires once per transition into the role rather than
 	// on every losing retry. A leadership term resets it.

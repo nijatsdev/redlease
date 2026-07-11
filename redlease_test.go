@@ -293,6 +293,42 @@ func TestRun_NilCallback_TokenDrivenStyle(t *testing.T) {
 	assert.False(t, e.IsLeader(), "must not be leader after shutdown")
 }
 
+// A second Run on the same Elector while one is already running would corrupt
+// shared leadership state; it must panic rather than fail silently. A new Run
+// after the previous one returned is legitimate.
+func TestRun_PanicsWhenCalledConcurrently(t *testing.T) {
+	t.Parallel()
+
+	_, rc := newRedis(t)
+	e := newElector(t, rc, "host-a")
+
+	ctx, cancel := context.WithCancel(t.Context())
+
+	exited := make(chan struct{})
+
+	go func() {
+		defer close(exited)
+
+		e.Run(ctx, nil)
+	}()
+
+	// Once leader, the first Run is certainly inside its loop.
+	require.Eventually(t, e.IsLeader, waitFor, 10*time.Millisecond, "did not become leader")
+
+	assert.Panics(t, func() { e.Run(ctx, nil) }, "a concurrent Run must panic")
+
+	cancel()
+
+	select {
+	case <-exited:
+	case <-time.After(waitFor):
+		t.Fatal("Run did not exit after context cancel")
+	}
+
+	// Sequential reuse stays allowed: a fresh Run after the previous returned.
+	assert.NotPanics(t, func() { e.Run(ctx, nil) }, "a sequential Run must not panic")
+}
+
 // Returning from the LeaderFunc ends the term: the lock is released and Run
 // re-contends, rather than holding leadership idle with no work running. The
 // next win is a new term with a strictly greater token.
