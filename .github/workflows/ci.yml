@@ -26,7 +26,7 @@ jobs:
           cache: true
 
       - name: go mod tidy check
-        run: go mod tidy && git diff --exit-code go.mod go.sum
+        run: make tidy
 
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v9
@@ -70,4 +70,4 @@ jobs:
       - name: Test
         env:
           REDIS_ADDR: 127.0.0.1:6379
-        run: go test -race -shuffle=on -count=1 ./...
+        run: make test
